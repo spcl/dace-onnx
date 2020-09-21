@@ -181,3 +181,108 @@ def expansion(node, state, sdfg):
         Z[:] = X ** Y
 
     return powop.to_sdfg()
+
+@register_pure_expansion("Softmax")
+def expansion(node, state, sdfg):
+    node.validate(sdfg, state)
+
+    axis = None
+    for name, attr in node.schema.attributes.items():
+        if hasattr(node, name):
+            if str(node.schema.attributes[name]) == "axis":
+                axis = getattr(node, name)
+    assert(axis == 3)
+    in_edges = state.in_edges(node)
+    ii = in_edges[0].data.subset.size()[0]
+    jj = in_edges[0].data.subset.size()[1]
+    kk = in_edges[0].data.subset.size()[2]
+    ll = in_edges[0].data.subset.size()[3]
+    I = str(ii)
+    J = str(jj)
+    K = str(kk)
+    L = str(ll)
+    sdfg_exp = dace.SDFG('softmaxExpansion')
+    sdfg_exp.add_array('input', (ii, jj, kk, ll), dace.float32)
+    sdfg_exp.add_array('output', (ii, jj, kk, ll), dace.float32)
+    state_exp = sdfg_exp.add_state()
+    ome, omx = state_exp.add_map('outer_map',
+                                 dict(i='0:' + I, j='0:' + J, k='0:' + K))
+    ime, imx = state_exp.add_map('inner_map', dict(l='0:' + L))
+
+    # tmp_max = dace.define_local([1], dtype=dace.float32)
+    # tmp_sum = dace.define_local([1], dtype=dace.float32)
+    tmp_max = state_exp.add_transient('tmp_max', (1, ), dace.float32)
+    tmp_sum = state_exp.add_transient('tmp_sum', (1, ), dace.float32)
+    tmp_out = state_exp.add_transient('tmp_out', (ii, jj, kk, ll),
+                                      dace.float32)
+    input = state_exp.add_read('input')
+    output = state_exp.add_access('output')
+
+    red1 = state_exp.add_reduce('lambda a1, b1: max(a1, b1)', None, 0)
+    texp1 = state_exp.add_tasklet('tasklet1', {'a2', 'b2'}, {'c2'},
+                                  'c2 = exp(a2-b2)')
+
+    state_exp.add_edge(
+        input, None, ome, None,
+        dace.Memlet.simple(input,
+                           '0:' + I + ', 0:' + J + ', 0:' + K + ', 0:' + L))
+    state_exp.add_edge(ome, None, red1, None,
+                       dace.Memlet.simple(input, 'i, j, k, 0:' + L))
+    state_exp.add_edge(red1, None, tmp_max, None,
+                       dace.Memlet.simple(tmp_max, '0'))
+
+    state_exp.add_edge(ome, None, ime, None,
+                       dace.Memlet.simple(input, 'i, j, k, 0:' + L))
+    state_exp.add_edge(tmp_max, None, ime, None,
+                       dace.Memlet.simple(tmp_max, '0'))
+
+    state_exp.add_edge(ime, None, texp1, "a2",
+                       dace.Memlet.simple(input, 'i, j, k, l'))
+    state_exp.add_edge(ime, None, texp1, "b2",
+                       dace.Memlet.simple(tmp_max, '0'))
+    state_exp.add_edge(texp1, "c2", imx, None,
+                       dace.Memlet.simple(tmp_out, 'i, j, k, l'))
+    state_exp.add_edge(imx, None, omx, None,
+                       dace.Memlet.simple(tmp_out, 'i, j, k, 0:' + L))
+    state_exp.add_edge(
+        omx, None, tmp_out, None,
+        dace.Memlet.simple(tmp_out,
+                           '0:' + I + ', 0:' + J + ', 0:' + K + ', 0:' + L))
+
+    ome1, omx1 = state_exp.add_map('outer_map1',
+                                   dict(i='0:' + I, j='0:' + J, k='0:' + K))
+    ime1, imx1 = state_exp.add_map('inner_map1', dict(l='0:' + L))
+    red2 = state_exp.add_reduce('lambda a3, b3: a3 + b3', None, 0)
+    texp2 = state_exp.add_tasklet('tasklet2', {'a4', 'b4'}, {'c4'},
+                                  'c4 = a4 / b4')
+
+    state_exp.add_edge(
+        tmp_out, None, ome1, None,
+        dace.Memlet.simple(tmp_out,
+                           '0:' + I + ', 0:' + J + ', 0:' + K + ', 0:' + L))
+    state_exp.add_edge(ome1, None, red2, None,
+                       dace.Memlet.simple(tmp_out, 'i, j, k, 0:' + L))
+    state_exp.add_edge(red2, None, tmp_sum, None,
+                       dace.Memlet.simple(tmp_sum, '0'))
+
+    state_exp.add_edge(ome1, None, ime1, None,
+                       dace.Memlet.simple(tmp_out, 'i, j, k, 0:' + L))
+    state_exp.add_edge(tmp_sum, None, ime1, None,
+                       dace.Memlet.simple(tmp_sum, '0'))
+
+    state_exp.add_edge(ime1, None, texp2, "a4",
+                       dace.Memlet.simple(tmp_out, 'i, j, k, l'))
+    state_exp.add_edge(ime1, None, texp2, "b4",
+                       dace.Memlet.simple(tmp_sum, '0'))
+    state_exp.add_edge(texp2, "c4", imx1, None,
+                       dace.Memlet.simple(output, 'i, j, k, l'))
+    state_exp.add_edge(imx1, None, omx1, None,
+                       dace.Memlet.simple(output, 'i, j, k, 0:' + L))
+    state_exp.add_edge(
+        omx1, None, output, None,
+        dace.Memlet.simple(output,
+                           '0:' + I + ', 0:' + J + ', 0:' + K + ', 0:' + L))
+
+    sdfg_exp.fill_scope_connectors()
+
+    return sdfg_exp
