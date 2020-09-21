@@ -31,7 +31,8 @@ def test_bert_encoder(gpu, apply_strict):
 
     assert np.max(diff) < 1e-5
     assert np.allclose(dace_outputs1, dace_outputs0)
-
+    
+    print("Testing passed")
 
 if __name__ == "__main__":
     test_bert_encoder(False, False)

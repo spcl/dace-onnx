@@ -1,0 +1,3 @@
+extern "C" int __dace_init_sub_sdfg(long long * __restrict__ array_concat_result, long long * __restrict__ array_inputs__0, long long * __restrict__ array_inputs__1, long long * __restrict__ array_inputs__2);
+extern "C" int __dace_exit_sub_sdfg(long long * __restrict__ array_concat_result, long long * __restrict__ array_inputs__0, long long * __restrict__ array_inputs__1, long long * __restrict__ array_inputs__2);
+extern "C" void __program_sub_sdfg(long long * __restrict__ array_concat_result, long long * __restrict__ array_inputs__0, long long * __restrict__ array_inputs__1, long long * __restrict__ array_inputs__2);
