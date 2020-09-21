@@ -394,3 +394,180 @@ def expansion(node, state, sdfg):
         sdfg_exp.fill_scope_connectors()
     return sdfg_exp
 
+
+@register_pure_expansion("MatMul")
+def expansion(node, state, sdfg):
+    inputs, outputs = _get_inputs_and_outputs(sdfg, state, node)
+    node.validate(sdfg, state)
+
+    in_edges = state.in_edges(node)
+    out_edges = state.out_edges(node)
+
+    atype = copy.deepcopy(sdfg.arrays[in_edges[0].data.data])
+    btype = copy.deepcopy(sdfg.arrays[in_edges[1].data.data])
+    ctype = copy.deepcopy(sdfg.arrays[out_edges[0].data.data])
+
+    input0_dim = len(in_edges[0].data.subset.size())
+    input1_dim = len(in_edges[1].data.subset.size())
+
+    if input0_dim == 4 and input1_dim == 4:
+
+        sdfg_exp = dace.SDFG('matmulExpansion')
+        mm = in_edges[0].data.subset.size()[0]
+        nn = in_edges[0].data.subset.size()[1]
+        ii = in_edges[0].data.subset.size()[2]
+        kk = in_edges[0].data.subset.size()[3]
+        jj = in_edges[1].data.subset.size()[3]
+
+        M = str(mm)
+        N = str(nn)
+        I = str(ii)
+        K = str(kk)
+        J = str(jj)
+
+        sdfg_exp.add_array('A', (mm, nn, ii, kk), dace.float32)
+        sdfg_exp.add_array('B', (mm, nn, kk, jj), dace.float32)
+        sdfg_exp.add_array('Y', (mm, nn, ii, jj), dace.float32)
+
+        init_state = sdfg_exp.add_state()
+        init_state.add_mapped_tasklet(
+            'batched_matmul_init', {
+                '_o%d' % i: '0:%s' % symstr(d)
+                for i, d in enumerate((mm, nn, ii, jj))
+            }, {},
+            'out = 0', {
+                'out':
+                dace.Memlet.simple(
+                    'Y', ','.join(
+                        ['_o%d' % i for i in range(len((mm, nn, ii, jj)))]))
+            },
+            external_edges=True)
+
+        state_exp = sdfg_exp.add_state_after(init_state)
+
+        state_exp.add_mapped_tasklet(
+            '_BatchedBatchedMatMult_',
+            {'__i%d' % i: '0:%s' % s
+             for i, s in enumerate([M, N, I, J, K])}, {
+                 '_a': dace.Memlet.simple("A", ('__i0, __i1, __i2, __i4')),
+                 '_b': dace.Memlet.simple("B", ('__i0, __i1, __i4, __i3'))
+             },
+            '_c = _a * _b', {
+                '_c':
+                dace.Memlet.simple("Y",
+                                   '__i0, __i1, __i2, __i3',
+                                   wcr_str='lambda x, y: x + y')
+            },
+            external_edges=True)
+        return sdfg_exp
+    elif input0_dim == 3 and input1_dim == 2:
+        sdfg_exp = dace.SDFG('matmulExpansion')
+        mm = in_edges[0].data.subset.size()[0]
+        ii = in_edges[0].data.subset.size()[1]
+        kk = in_edges[0].data.subset.size()[2]
+        jj = in_edges[1].data.subset.size()[1]
+
+        M = str(mm)
+        I = str(ii)
+        K = str(kk)
+        J = str(jj)
+
+        sdfg_exp.add_array('A', (mm, ii, kk), dace.float32)
+        sdfg_exp.add_array('B', (kk, jj), dace.float32)
+        sdfg_exp.add_array('Y', (mm, ii, jj), dace.float32)
+
+        init_state = sdfg_exp.add_state()
+        init_state.add_mapped_tasklet(
+            'batched_matmul_init',
+            {'_o%d' % i: '0:%s' % symstr(d)
+             for i, d in enumerate((mm, ii, jj))}, {},
+            'out = 0', {
+                'out':
+                dace.Memlet.simple(
+                    'Y', ','.join(['_o%d' % i for i in range(len((mm, ii, jj)))]))
+            },
+            external_edges=True)
+
+        state_exp = sdfg_exp.add_state_after(init_state)
+
+        state_exp.add_mapped_tasklet(
+            '_BatchedBatchedMatMult_',
+            {'__i%d' % i: '0:%s' % s
+             for i, s in enumerate([M, I, J, K])}, {
+                 '_a': dace.Memlet.simple("A", ('__i0, __i1, __i3')),
+                 '_b': dace.Memlet.simple("B", ('__i3, __i2'))
+             },
+            '_c = _a * _b', {
+                '_c':
+                dace.Memlet.simple(
+                    "Y", '__i0, __i1, __i2', wcr_str='lambda x, y: x + y')
+            },
+            external_edges=True)
+        return sdfg_exp
+    else:
+        print("Unsupported dimensions for MatMul")
+
+
+@register_pure_expansion("Transpose")
+def expansion(node, state, sdfg):
+    inputs, outputs = _get_inputs_and_outputs(sdfg, state, node)
+    node.validate(sdfg, state)
+    perm = None
+    for name, attr in node.schema.attributes.items():
+        if hasattr(node, name):
+            if str(node.schema.attributes[name]) == "perm":
+                perm = getattr(node, name)
+    
+    in_edges = state.in_edges(node)
+    input_dim = len(in_edges[0].data.subset.size())
+
+    sdfg_exp = dace.SDFG('TransposeExpansion')
+
+    assert(input_dim == 4)
+
+    ii = in_edges[0].data.subset.size()[0]
+    jj = in_edges[0].data.subset.size()[1]
+    kk = in_edges[0].data.subset.size()[2]
+    ll = in_edges[0].data.subset.size()[3]
+    I = str(ii)
+    J = str(jj)
+    K = str(kk)
+    L = str(ll)
+
+    if perm == [0, 2, 1, 3]:
+        sdfg_exp.add_array('data', (ii, jj, kk, ll), dace.float32)
+        sdfg_exp.add_array('transposed', (ii, kk, jj, ll), dace.float32)
+
+        state_exp = sdfg_exp.add_state()
+
+        task1 = state_exp.add_tasklet('iden', {'_a'}, {'_b'}, '_b = _a')
+
+        data = state_exp.add_read('data')
+        transposed = state_exp.add_access('transposed')
+
+        me1, mx1 = state_exp.add_map('map1', dict(i='0:' + I, j='0:' + J, k='0:' + K, l='0:' + L))
+        state_exp.add_edge(data, None, me1, None, dace.Memlet.simple(data, '0:'+I+', 0:'+J+', 0:'+K+', 0:'+L))
+        state_exp.add_edge(me1, None, task1, '_a', dace.Memlet.simple(data, 'i, j, k, l'))
+        state_exp.add_edge(task1, '_b', mx1, None, dace.Memlet.simple(transposed, 'i, k, j, l'))
+        state_exp.add_edge(mx1, None, transposed, None, dace.Memlet.simple(transposed, '0:'+I+', 0:'+K+', 0:'+J+', 0:'+L))
+        sdfg_exp.fill_scope_connectors()
+
+    elif perm == [0, 2, 3, 1]:
+        sdfg_exp.add_array('data', (ii, jj, kk, ll), dace.float32)
+        sdfg_exp.add_array('transposed', (ii, kk, ll, jj), dace.float32)
+
+        state_exp = sdfg_exp.add_state()
+
+        task1 = state_exp.add_tasklet('iden', {'_a'}, {'_b'}, '_b = _a')
+
+        data = state_exp.add_read('data')
+        transposed = state_exp.add_access('transposed')
+
+        me1, mx1 = state_exp.add_map('map1', dict(i='0:' + I, j='0:' + J, k='0:' + K, l='0:' + L))
+        state_exp.add_edge(data, None, me1, None, dace.Memlet.simple(data, '0:'+I+', 0:'+J+', 0:'+K+', 0:'+L))
+        state_exp.add_edge(me1, None, task1, '_a', dace.Memlet.simple(data, 'i, j, k, l'))
+        state_exp.add_edge(task1, '_b', mx1, None, dace.Memlet.simple(transposed, 'i, k, l, j'))
+        state_exp.add_edge(mx1, None, transposed, None, dace.Memlet.simple(transposed, '0:'+I+', 0:'+K+', 0:'+L+', 0:'+J))
+        sdfg_exp.fill_scope_connectors()
+
+    return sdfg_exp
