@@ -1,12 +1,13 @@
 import copy
 from math import sqrt
+from math import erf
 
 import dace
 from dace.libraries.standard.nodes.code import _get_inputs_and_outputs
 from dace.symbolic import symstr
 
 from daceml.onnx.implementation_repository import register_pure_expansion
-
+import numpy as np
 
 
 @register_pure_expansion("Div")
@@ -145,6 +146,121 @@ def expansion(node, state, sdfg):
     sdfg_exp.fill_scope_connectors()
 
     return sdfg_exp
+
+
+
+#Todo, not safe to copy directly
+@register_pure_expansion("Cast")
+def expansion(node, state, sdfg):
+    inputs, outputs = _get_inputs_and_outputs(sdfg, state, node)
+    node.validate(sdfg, state)
+
+    in_edges = state.in_edges(node)
+    out_edges = state.out_edges(node)
+
+    atype = copy.deepcopy(sdfg.arrays[in_edges[0].data.data])
+    btype = copy.deepcopy(sdfg.arrays[out_edges[0].data.data])
+
+    @dace.program
+    def castop(input: atype, output: btype):
+        #output[:] = int(input)
+        output[:] = input
+
+    return castop.to_sdfg()
+
+#@register_pure_expansion("Cast")
+#def expansion(node, state, sdfg):
+#    node.validate(sdfg, state)
+#
+#    in_edges = state.in_edges(node)
+#    out_edges = state.out_edges(node)
+#
+#    input_dim = len(in_edges[0].data.subset.size())
+#    output_dim = len(out_edges[0].data.subset.size())
+#
+#    sdfg_exp = dace.SDFG('castExpansion')
+#
+#    assert(input_dim == 3 and output_dim == 3)
+#
+#    mm = in_edges[0].data.subset.size()[0]
+#    nn = in_edges[0].data.subset.size()[1]
+#    kk = in_edges[0].data.subset.size()[2]
+#
+#    M = str(mm)
+#    N = str(nn)
+#    K = str(kk)
+#
+#    sdfg_exp.add_array('input', (mm, nn, kk), dace.float32)
+#    sdfg_exp.add_array('output', (mm, nn, kk), dace.int64)
+#
+#    state_exp = sdfg_exp.add_state()
+#    input = state_exp.add_read('input')
+#    output = state_exp.add_access('output')
+#    me, mx = state_exp.add_map('outer_map',
+#                               dict(i='0:' + M, j='0:' + N, k='0:' + K))
+#
+#    tcast = state_exp.add_tasklet('tcast', {'_a'}, {'_b'}, '_b = int(_a)')
+#
+#    state_exp.add_edge(
+#        input, None, me, None,
+#        dace.Memlet.simple(input, '0:' + M + ', 0:' + N + ', 0:' + K))
+#    state_exp.add_edge(me, None, tcast, '_a',
+#                       dace.Memlet.simple(input, 'i, j, k'))
+#    state_exp.add_edge(tcast, '_b', mx, None,
+#                       dace.Memlet.simple(output, 'i, j, k'))
+#    state_exp.add_edge(
+#        mx, None, output, None,
+#        dace.Memlet.simple(output, '0:' + M + ', 0:' + N + ', 0:' + K))
+#    sdfg_exp.fill_scope_connectors()
+#    return sdfg_exp
+
+@register_pure_expansion("Erf")
+def expansion(node, state, sdfg):
+    node.validate(sdfg, state)
+
+    in_edges = state.in_edges(node)
+    out_edges = state.out_edges(node)
+
+    input_dim = len(in_edges[0].data.subset.size())
+    output_dim = len(out_edges[0].data.subset.size())
+
+    sdfg_exp = dace.SDFG('erfExpansion')
+
+    assert(input_dim == 3 and output_dim == 3)
+
+    mm = in_edges[0].data.subset.size()[0]
+    nn = in_edges[0].data.subset.size()[1]
+    kk = in_edges[0].data.subset.size()[2]
+
+    M = str(mm)
+    N = str(nn)
+    K = str(kk)
+
+    sdfg_exp.add_array('input', (mm, nn, kk), dace.float32)
+    sdfg_exp.add_array('output', (mm, nn, kk), dace.float32)
+
+    state_exp = sdfg_exp.add_state()
+    input = state_exp.add_read('input')
+    output = state_exp.add_access('output')
+    me, mx = state_exp.add_map('outer_map',
+                               dict(i='0:' + M, j='0:' + N, k='0:' + K))
+
+    terf = state_exp.add_tasklet('terf', {'_a'}, {'_b'}, '_b = erf(_a)')
+
+    state_exp.add_edge(
+        input, None, me, None,
+        dace.Memlet.simple(input, '0:' + M + ', 0:' + N + ', 0:' + K))
+    state_exp.add_edge(me, None, terf, '_a',
+                       dace.Memlet.simple(input, 'i, j, k'))
+    state_exp.add_edge(terf, '_b', mx, None,
+                       dace.Memlet.simple(output, 'i, j, k'))
+    state_exp.add_edge(
+        mx, None, output, None,
+        dace.Memlet.simple(output, '0:' + M + ', 0:' + N + ', 0:' + K))
+    sdfg_exp.fill_scope_connectors()
+    return sdfg_exp
+
+
 
 @register_pure_expansion("Sqrt")
 def expansion(node, state, sdfg):
