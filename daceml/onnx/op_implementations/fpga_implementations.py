@@ -1822,7 +1822,7 @@ if n1 <= p:
 
 
 @autoregister_params(op="Reshape", name="fpga")
-class PureReshape(ONNXForward):
+class Reshape(ONNXForward):
     @staticmethod
     def forward(node: ONNXOp, state: SDFGState,
                 sdfg: SDFG) -> typing.Union[Node, SDFG]:
