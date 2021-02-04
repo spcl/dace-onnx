@@ -389,7 +389,7 @@ class ONNXModel:
 
             # TODO @orausch add error handling for evalf
             shape = [
-                eval_dim(d) if type(d) is dace.symbol else d for d in arr.shape
+                eval_dim(d) if type(d) is dace.symbol or dace.symbolic.issymbolic(d) else d for d in arr.shape
             ]
             outputs[clean_name] = np.empty(shape,
                                            dtype=arr.dtype.as_numpy_dtype())

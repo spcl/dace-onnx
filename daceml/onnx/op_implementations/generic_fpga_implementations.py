@@ -72,6 +72,15 @@ class FPGARelu(ONNXForward):
     @staticmethod
     def forward_can_be_applied(node: ONNXOp, state: SDFGState,
                                sdfg: SDFG) -> bool:
+        X = in_desc_with_name(node, state, sdfg, "X")
+        Y = out_desc_with_name(node, state, sdfg, "Y")
+
+        if len(X.shape) != 4:
+            return False
+
+        # TODO: For the moment being, we support the same vect width
+        if X.veclen != Y.veclen:
+            return False
         return True
 
     @staticmethod
@@ -81,8 +90,6 @@ class FPGARelu(ONNXForward):
         X = in_desc_with_name(node, state, sdfg, "X")
         Y = out_desc_with_name(node, state, sdfg, "Y")
 
-        # TODO deal with this. Right Now I'm doing it to
-        # gently introduce streaming
         vec_width = X.veclen
 
         streaming_node = False
@@ -93,17 +100,46 @@ class FPGARelu(ONNXForward):
         else:
             vec_width_mismatch = False
 
-        # Build map ranges: one loop per dimension
-        map_ranges = {'__i%d' % i: '0:%s' % n for i, n in enumerate(X.shape)}
+        # Build map ranges: one loop per dimension. We use internal symbols here, that will
+        # be mapped to external ones
 
         new_sdfg = dace.SDFG("fpga_relu")
-
+        map_ranges = {
+            '__i0': "0:batch_size",
+            '__i1': "0:input_channels",
+            '__i2': "0:input_height",
+            '__i3': "0:input_width"
+        }
+        batch_size = dace.symbol("batch_size")
+        input_channels = dace.symbol("input_channels")
+        input_height = dace.symbol("input_height")
+        input_width = dace.symbol("input_width")
         new_state = new_sdfg.add_state("compute")
-        new_sdfg.add_datadesc("X", copy.deepcopy(X))
-        new_sdfg.add_datadesc("Y", copy.deepcopy(Y))
+        new_sdfg.add_symbol(batch_size.name, dace.int32)
+        new_sdfg.add_symbol(input_channels.name, dace.int32)
+        new_sdfg.add_symbol(input_height.name, dace.int32)
+        new_sdfg.add_symbol(input_width.name, dace.int32)
 
-        new_sdfg.arrays["X"].transient = False
-        new_sdfg.arrays["Y"].transient = False
+        # Create local versions of input data nodes, but using our new symbols, not the real ones
+        # in order to not use external shapes. Later we will do symbol mapping
+        new_sdfg.add_array(
+            "X",
+            shape=(batch_size, input_channels, input_height, input_width),
+            dtype=X.dtype,
+            storage=X.storage,
+            strides=(input_channels * input_height * input_width,
+                     input_height * input_width, input_width, 1),
+            transient=False)
+
+        new_sdfg.add_array(
+            "Y",
+            shape=(batch_size, input_channels, input_height, input_width),
+            dtype=Y.dtype,
+            storage=Y.storage,
+            strides=(input_channels * input_height * input_width,
+                     input_height * input_width, input_width, 1),
+            transient=False)
+
         outer_me, outer_mx = new_state.add_map('relu_map', map_ranges)
 
         new_sdfg.add_array("vec_data_in", [vec_width],
@@ -121,7 +157,6 @@ class FPGARelu(ONNXForward):
         # Unrolled map to compute the elementwise max
         inner_me, inner_mx = new_state.add_map(
             'inner_relu_map', dict(i="0:{}".format(vec_width)), unroll=True)
-
 
         tasklet = new_state.add_tasklet('relu_task', ['x_con'], ['y_con'],
                                         'y_con = max(0.0, x_con)')
@@ -192,8 +227,37 @@ class FPGARelu(ONNXForward):
                 memlet=dace.Memlet("Y[{}]".format(",".join(
                     ['__i%d' % i for i in range(len(X.shape))]))))
         new_sdfg.fill_scope_connectors()
-        return new_sdfg
 
+        # Modify internal schedules according to node schedule
+        if node.schedule != dace.ScheduleType.Default:
+            for nstate in new_sdfg.nodes():
+                for topnode, scope in nstate.scope_dict().items():
+                    if scope is None and isinstance(
+                            topnode,
+                        (dace.nodes.EntryNode, dace.nodes.LibraryNode)):
+                        topnode.schedule = node.schedule
+
+        # symbols = sdfg.free_symbols
+        # symbol_mapping = {s: s for s in symbols}
+        symbol_mapping = dict()
+        new_sdfg.save("/tmp/newsdfg.sdfg")
+
+        # nest and map symbol
+        symbol_mapping["batch_size"] = X.shape[0]
+        symbol_mapping["input_channels"] = X.shape[1]
+        symbol_mapping["input_height"] = X.shape[2]
+        symbol_mapping["input_width"] = X.shape[3]
+
+        expansion = state.add_nested_sdfg(new_sdfg,
+                                          sdfg,
+                                          node.in_connectors,
+                                          node.out_connectors,
+                                          name=node.name,
+                                          debuginfo=node.debuginfo,
+                                          symbol_mapping=symbol_mapping)
+
+        expansion.sdfg.save('/tmp/expansion.sdfg')
+        return expansion
 
 
 @autoregister_params(op="MaxPool", name="generic_fpga")
@@ -250,25 +314,56 @@ class FPGAMaxPool2D(ONNXForward):
         vec_width = X.veclen
 
         image_dims = len(X.shape) - 2
-        batch_size = X.shape[0]
-        num_channels = X.shape[1]
+        # batch_size = X.shape[0]
+        # num_channels = X.shape[1]
         strides = node.strides if node.strides is not None else [
             1 for _ in range(image_dims)
         ]
+        #TODO: symbolize
         stride_height, stride_width = strides
         filter_height, filter_width = node.kernel_shape
-        input_size_height, input_size_width = X.shape[2:]
-        output_size_y, output_size_x = Y.shape[2:]
+        # input_size_height, input_size_width = X.shape[2:]
+        # output_size_y, output_size_x = Y.shape[2:]
 
         new_sdfg = dace.SDFG("fpga_maxpool")
         new_state = new_sdfg.add_state("compute")
 
-        # we don't need initialization
+        batch_size = dace.symbol("batch_size")
+        input_channels = dace.symbol("input_channels")
+        input_height = dace.symbol("input_height")
+        input_width = dace.symbol("input_width")
+        output_height = dace.symbol("output_height")
+        output_width = dace.symbol("output_width")
+        new_sdfg.add_symbol(batch_size.name, dace.int32)
+        new_sdfg.add_symbol(input_channels.name, dace.int32)
+        new_sdfg.add_symbol(input_height.name, dace.int32)
+        new_sdfg.add_symbol(input_width.name, dace.int32)
+        new_sdfg.add_symbol(output_height.name, dace.int32)
+        new_sdfg.add_symbol(output_width.name, dace.int32)
 
-        new_sdfg.add_datadesc("X", copy.deepcopy(X))
-        new_sdfg.add_datadesc("Y", copy.deepcopy(Y))
-        new_sdfg.arrays["X"].transient = False
-        new_sdfg.arrays["Y"].transient = False
+        new_sdfg.add_array(
+            "X",
+            shape=(batch_size, input_channels, input_height, input_width),
+            dtype=X.dtype,
+            storage=X.storage,
+            strides=(input_channels * input_height * input_width,
+                     input_height * input_width, input_width, 1),
+            transient=False)
+
+        new_sdfg.add_array(
+            "Y",
+            shape=(batch_size, input_channels, output_height, output_width),
+            dtype=Y.dtype,
+            storage=Y.storage,
+            strides=(input_channels * output_height * output_width,
+                     output_height * output_width, output_width, 1),
+            transient=False)
+
+        # new_sdfg.add_datadesc("X", copy.deepcopy(X))
+        # new_sdfg.add_datadesc("Y", copy.deepcopy(Y))
+        #
+        # new_sdfg.arrays["X"].transient = False
+        # new_sdfg.arrays["Y"].transient = False
 
         # variable for reduction
         new_sdfg.add_array("max_res", [1],
@@ -289,10 +384,9 @@ class FPGAMaxPool2D(ONNXForward):
         outer_me, outer_mx = new_state.add_map(
             'outer_pool_map',
             dict(b="0:{}".format(batch_size),
-                 c="0:{}".format(num_channels),
-                 out_y="0:{}".format(output_size_y),
-                 out_x="0:{}".format(output_size_x)))
-
+                 c="0:{}".format(input_channels),
+                 out_y="0:{}".format(output_height),
+                 out_x="0:{}".format(output_width)))
 
         # the inner map computes the pooling
         inner_me, inner_mx = new_state.add_map(
@@ -313,33 +407,32 @@ class FPGAMaxPool2D(ONNXForward):
             outputs={"output", "max_out"},
             code="if hx == 0 and hy == 0: max_in = {}\n"  #init
             "max_out = float(max(max_in, image_in))\n"
-            "if hy == {} - 1 and hx == {} -1: output = max_out"
-            .format(dtypes.min_value(Y.dtype), filter_height, filter_width,
-                    filter_height, filter_height, vec_width, filter_height,
-                    filter_width))
-
+            "if hy == {} - 1 and hx == {} -1: output = max_out".format(
+                dtypes.min_value(Y.dtype), filter_height, filter_width,
+                filter_height, filter_height, vec_width, filter_height,
+                filter_width))
 
         read_X = new_state.add_read("X")
         write_Y = new_state.add_write("Y")
         read_max_res = new_state.add_access("max_res")
-        write_max_res = new_state.add_write("max_res")
+        write_max_res = new_state.add_access("max_res")
 
         # memlets: input data
 
-
-        new_state.add_memlet_path(read_X,
-                                  outer_me,
-                                  inner_me,
-                                  compute_tasklet,
-                                  dst_conn="image_in",
-                                  memlet=dace.Memlet("X[b, c, out_y*{}+hy, out_x*{}+hx]".format(filter_height, filter_height)))
+        new_state.add_memlet_path(
+            read_X,
+            outer_me,
+            inner_me,
+            compute_tasklet,
+            dst_conn="image_in",
+            memlet=dace.Memlet("X[b, c, out_y*{}+hy, out_x*{}+hx]".format(
+                filter_height, filter_height)))
         #memlets for max
         new_state.add_memlet_path(read_max_res,
                                   inner_me,
                                   compute_tasklet,
                                   dst_conn="max_in",
                                   memlet=dace.Memlet("max_res[0]"))
-
 
         new_state.add_memlet_path(compute_tasklet,
                                   inner_mx,
@@ -355,7 +448,33 @@ class FPGAMaxPool2D(ONNXForward):
                                   src_conn="output",
                                   memlet=dace.Memlet("Y[b,c,out_y, out_x]"),
                                   propagate=False)
+        #put max_res in scope
+        new_state.add_memlet_path(outer_me, read_max_res, memlet=dace.Memlet())
+        new_state.add_memlet_path(write_max_res,
+                                  outer_mx,
+                                  memlet=dace.Memlet())
 
         new_sdfg.fill_scope_connectors()
-        new_sdfg.save("/tmp/maxpool.sdfg")
+
+        # nest the sdfg and map symbols
+        symbol_mapping = {
+            "batch_size": X.shape[0],
+            "input_channels": X.shape[1],
+            "input_height": X.shape[2],
+            "input_width": X.shape[3],
+            "output_height": Y.shape[2],
+            "output_width": Y.shape[3]
+        }
+
+        expansion = state.add_nested_sdfg(new_sdfg,
+                                          sdfg,
+                                          node.in_connectors,
+                                          node.out_connectors,
+                                          name=node.name,
+                                          debuginfo=node.debuginfo,
+                                          symbol_mapping=symbol_mapping)
+
+        expansion.sdfg.save('/tmp/expansion.sdfg')
+        return expansion
+
         return new_sdfg
