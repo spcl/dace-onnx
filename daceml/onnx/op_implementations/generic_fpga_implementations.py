@@ -229,6 +229,7 @@ class FPGARelu(ONNXForward):
         new_sdfg.fill_scope_connectors()
 
         # Modify internal schedules according to node schedule
+        # TODO: is this needed?
         if node.schedule != dace.ScheduleType.Default:
             for nstate in new_sdfg.nodes():
                 for topnode, scope in nstate.scope_dict().items():
