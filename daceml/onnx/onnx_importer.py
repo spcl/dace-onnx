@@ -107,6 +107,17 @@ class ONNXModel:
         self.inputs: typing.List[str] = []  #: the inputs to the model
         self.outputs: typing.List[str] = []  #: the outputs of the model
 
+        # If the ONNX model has been exported with `keep_initializers_as_input` we will find the same info
+        # both in `graph.initializer` and in `graph.input`. We keep track of them, in order to not process
+        # them two times, or treat later one initializers as input data (if an initializer is found, its value
+        # is added to self.weights)
+        # How we deal with such a case: the onnx model could have been exported with dynamic shapes:
+        # - we first process the initializer as inputs, adding them as array, using a symbolic shape
+        # - when we later encounter them as weights, if they have been already processed as input we copy only
+        #       their value
+
+        self.initializers_as_inputs: typing.List[str] = []
+
         for value, is_input in chain(zip(graph.input, repeat(True)),
                                      zip(graph.output, repeat(False))):
             if not value.HasField("name"):
@@ -259,9 +270,19 @@ class ONNXModel:
                         "Invalid ONNX model; found two values with name '{}', but different dtypes ({} and {})"
                         .format(name, existing_arr.dtype, dtype))
                 if tuple(existing_arr.shape) != tuple(dims):
-                    raise ValueError(
-                        "Invalid ONNX model; found two values with name '{}', but different dimensions ({} and {})"
-                        .format(name, existing_arr.shape, dims))
+                    # if the existing array shape is symbolic, it means that we are importing with dynamic axes
+                    # and keep_initializers_as_input = True
+                    # TODO: any better way of doing this?
+                    dynamic_shape = True in (dace.symbolic.issymbolic(el)
+                                             for el in existing_arr.shape)
+                    if dynamic_shape:
+                        # keep track of it
+                        self.initializers_as_inputs.append(tensor.name)
+
+                    else:
+                        raise ValueError(
+                            "Invalid ONNX model; found two values with name '{}', but different dimensions ({} and {})"
+                            .format(name, existing_arr.shape, dims))
 
         self.weights[tensor.name] = numpy_helper.to_array(tensor)
 
@@ -340,7 +361,10 @@ class ONNXModel:
         inputs.update(dict(zip(self.inputs, args)))
 
         # check that there are no missing inputs
-        if len(set(self.inputs).difference(inputs)) != 0:
+        # Do not consider initializer that have been exported as initializers
+        if len(
+                set(self.inputs).difference(inputs).difference(
+                    set(self.initializers_as_inputs))) != 0:
             raise ValueError("Missing inputs {}".format(", ".join(
                 set(self.inputs).difference(inputs))))
 
@@ -389,7 +413,9 @@ class ONNXModel:
 
             # TODO @orausch add error handling for evalf
             shape = [
-                eval_dim(d) if type(d) is dace.symbol or dace.symbolic.issymbolic(d) else d for d in arr.shape
+                eval_dim(d)
+                if type(d) is dace.symbol or dace.symbolic.issymbolic(d) else d
+                for d in arr.shape
             ]
             outputs[clean_name] = np.empty(shape,
                                            dtype=arr.dtype.as_numpy_dtype())
