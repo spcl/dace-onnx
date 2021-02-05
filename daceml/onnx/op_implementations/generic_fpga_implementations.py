@@ -478,4 +478,583 @@ class FPGAMaxPool2D(ONNXForward):
         expansion.sdfg.save('/tmp/expansion.sdfg')
         return expansion
 
-        return new_sdfg
+
+@autoregister_params(op="Gemm", name="generic_fpga")
+class FPGAGemm(ONNXForward):
+    @staticmethod
+    def forward_can_be_applied(node: ONNXOp, state: SDFGState,
+                               sdfg: SDFG) -> bool:
+        if node.alpha == 1.0 and node.beta == 1.0 and node.transA == 0 and node.transB == 1:
+            return True
+
+        return False
+
+    @staticmethod
+    def forward(node: ONNXOp, state: SDFGState,
+                sdfg: SDFG) -> typing.Union[Node, SDFG]:
+        node.validate(sdfg, state)
+
+        assert node.alpha == 1.0 and node.beta == 1.0 and node.transA == 0 and node.transB == 1
+
+        A = in_desc_with_name(node, state, sdfg, "A")
+        B = in_desc_with_name(node, state, sdfg, "B")
+        C = in_desc_with_name(node, state, sdfg, "C")
+        Y = out_desc_with_name(node, state, sdfg, "Y")
+
+        new_sdfg = dace.SDFG("fpga_gemm")
+        new_state = new_sdfg.add_state("compute")
+
+        batch_size = dace.symbol("batch_size")
+        input_features = dace.symbol("input_features")
+        output_features = dace.symbol("output_features")
+        new_sdfg.add_symbol(batch_size.name, dace.int32)
+        new_sdfg.add_symbol(input_features.name, dace.int32)
+        new_sdfg.add_symbol(output_features.name, dace.int32)
+
+        # Create local versions of input data nodes, but using our new symbols, not the real ones
+        # in order to not use external shapes and complicated formulas that could pop out from shape inference.
+        # Later we will do symbol mapping
+
+        new_sdfg.add_array(
+            "A",
+            shape=(batch_size, input_features),
+            dtype=A.dtype,
+            storage=A.storage,
+            strides=(input_features, 1),
+            transient=False)
+
+        new_sdfg.add_array(
+            "B",
+            shape=(output_features, input_features),
+            dtype=B.dtype,
+            storage=B.storage,
+            strides=(input_features, 1),
+            transient=False)
+
+        new_sdfg.add_array(
+            "C",
+            shape=[output_features],
+            dtype=C.dtype,
+            storage=C.storage,
+            strides=[1],
+            transient=False)
+
+        new_sdfg.add_array(
+            "Y",
+            shape=(batch_size, output_features,),
+            dtype=Y.dtype,
+            storage=Y.storage,
+            strides=(output_features, 1),
+            transient=False)
+
+        # GEMM Parameters
+        N = batch_size
+        K = input_features
+        M = output_features
+
+        # while the output Y can be vectorized
+        # M_C = C.shape[0]
+        # M_Y = Y.shape[1]
+
+        # GEMM Computational Units parameters
+        # TODO: these as libnode parameter
+        # TODO: deal with dimensions that are not multiple of this
+
+
+        P = 8 # Number of Processing Elements
+        T = 84 # Tile size
+        vec_width = Y.veclen
+        # TODO:implement
+        assert vec_width == 1
+
+        #safe delay
+        L = max(11 - T, 0)
+
+
+        ####################################################
+        # Build the SDFG: starting point: gemm_fpga_systolic vectorized sample
+
+        def make_read_A(state):
+
+            # TODO: vectorize also this, by reading more than one element at a time
+            entry, exit = state.add_map("read_A", {
+                "n0": "0:{}/{}".format(N, P),
+                "tm": "0:{}/{}".format(M, T),  # must be repeated according to the tile size
+                "k": "0:{}".format(K)
+            },
+                                        schedule=dace.ScheduleType.FPGA_Device)
+            # use a different map, and unroll it if necessary
+            unroll_inner_map = P > (T + L) and P <= 16
+            send_map_entry, send_map_exit = state.add_map(
+                "send_A", {"n1": "0:{}".format(P)},
+                schedule=dace.ScheduleType.FPGA_Device,
+                unroll=unroll_inner_map)
+
+            mem = state.add_read("A")
+            pipe = state.add_write("A_pipe")
+            tasklet = state.add_tasklet("read_A", {"from_memory"},
+                                        {"to_kernel"},
+                                        "to_kernel = from_memory")
+
+            state.add_memlet_path(mem,
+                                  entry,
+                                  send_map_entry,
+                                  tasklet,
+                                  dst_conn="from_memory",
+                                  memlet=dace.Memlet(
+                                      "A[n0 * {} + n1, k]".format(P)))
+            state.add_memlet_path(tasklet,
+                                  send_map_exit,
+                                  exit,
+                                  pipe,
+                                  src_conn="to_kernel",
+                                  memlet=dace.Memlet(
+                                      "A_pipe[{} - n1 - 1]".format(P)))
+
+        def make_read_B(state, sdfg, vec_width=1):
+
+            # NOTE: We are reading this transposed: B is originally a matrix MxK
+
+            # B is accessed by row for the GEMM in LENET
+            # gear boxing: we read plain data types, we stream vector data types
+            # Therefore we have two maps, the innermost is unrolled
+            entry, exit = state.add_map("read_B", {
+                "n": "0:{}/{}".format(N, P),
+                "tm": "0:{}/{}".format(M, T),
+                "m": "0:{}".format(K),
+                "k0": "0:{}/{}".format(M, vec_width)
+            },
+                                        schedule=dace.ScheduleType.FPGA_Device)
+
+            read_map_entry, read_map_exit = state.add_map(
+                "unrolled_reads_B", {"k1": "0:{}".format(vec_width)},
+                schedule=dace.ScheduleType.FPGA_Device,
+                unroll=True)
+
+            # local storage to accumulate data
+            sdfg.add_array('vec_data_B',
+                           shape=[vec_width],
+                           dtype=dace.float32,
+                           transient=True,
+                           storage=dace.dtypes.StorageType.FPGA_Registers)
+            mem = state.add_read("B")
+            pipe = state.add_write("B_pipe")
+            vect_data = state.add_access("vec_data_B")
+            tasklet = state.add_tasklet("read_B", {"from_memory"},
+                                        {"to_kernel"},
+                                        "to_kernel = from_memory")
+
+            # In the innermost map we read W=vec_width data elements and we store them into `vec_data`
+            state.add_memlet_path(mem,
+                                  entry,
+                                  read_map_entry,
+                                  tasklet,
+                                  dst_conn="from_memory",
+                                  memlet=dace.Memlet(
+                                      "B[k0*{}+k1, tm*{} + m]".format(vec_width, T)))
+
+            state.add_memlet_path(tasklet,
+                                  read_map_exit,
+                                  vect_data,
+                                  src_conn="to_kernel",
+                                  memlet=dace.Memlet("vec_data_B[k1]"))
+
+            # then we transfer them to the output stream
+            copy_out_tasklet = state.add_tasklet('pack_and_copy_to_stream_B',
+                                                 {'in_con'}, {'out_con'},
+                                                 'out_con = in_con')
+            state.add_memlet_path(vect_data,
+                                  copy_out_tasklet,
+                                  dst_conn="in_con",
+                                  memlet=dace.Memlet("vec_data_B"))
+
+            state.add_memlet_path(copy_out_tasklet,
+                                  exit,
+                                  pipe,
+                                  src_conn="out_con",
+                                  memlet=dace.Memlet("B_pipe[0]"))
+
+        def make_write_C(state, sdfg, vec_width):
+
+            # C data arrives as expressed in vect. data type. Needs to be unpacked
+            # For doing so we first store it into a local buffer and then we write it in memory
+            # as gear boxing works on local data only (not global memory)
+
+            # Terrible hack to deal with different vec size between C and Y
+            if C.veclen != Y.veclen:
+                deal_with_misread = True
+            else:
+                deal_with_misread = False
+
+            pipe = state.add_read("C_pipe")
+            mem_read = state.add_read("C")
+            mem = state.add_write("Y")
+
+
+            # TODO: when T!=M this must be fixed
+            entry_map, exit_map = state.add_map(
+                "write_C",
+                {
+                    "n": "0:{}".format(N),
+                    "tm": "0:{}/{}".format(M, T),
+                    "m": "0:{}".format(T)  #consider also vectorization
+                },
+                schedule=dace.ScheduleType.FPGA_Device)
+
+
+
+            # then we copy that to memory
+
+            if deal_with_misread:
+                add_map_entry, add_map_exit = state.add_map(
+                    "add_C", {"m1": "0:{}".format(vec_width)},
+                    schedule=dace.ScheduleType.FPGA_Device,
+                    unroll=True)
+                # local storage to accumulate data
+                sdfg.add_array('vec_data_C',
+                               shape=[vec_width],
+                               dtype=dace.float32,
+                               transient=True,
+                               storage=dace.dtypes.StorageType.FPGA_Registers)
+
+                vect_data = state.add_access("vec_data_C")
+                # local storage to accumulate data
+                sdfg.add_array('vec_res',
+                               shape=[vec_width],
+                               dtype=dace.float32,
+                               transient=True,
+                               storage=dace.dtypes.StorageType.FPGA_Registers)
+                vect_res = state.add_access("vec_res")
+
+                # then we transfer them to the output stream
+                copy_in_tasklet = state.add_tasklet('copy_from_stream_C',
+                                                    {'in_con'}, {'out_con'},
+                                                    'out_con = in_con')
+
+                state.add_memlet_path(pipe,
+                                      entry_map,
+                                      copy_in_tasklet,
+                                      dst_conn="in_con",
+                                      memlet=dace.Memlet(
+                                          "C_pipe[{}-1]".format(P)))
+                # this will trigger gear boxing
+                state.add_memlet_path(copy_in_tasklet,
+                                      vect_data,
+                                      src_conn="out_con",
+                                      memlet=dace.Memlet("vec_data_C"))
+
+                # add C
+                add_C_tasklet = state.add_tasklet('add_C_tasklet',
+                                                  {'in_con', 'prev_c'},
+                                                  {'out_con'},
+                                                  'out_con = in_con + prev_c')
+                state.add_memlet_path(vect_data,
+                                      add_map_entry,
+                                      add_C_tasklet,
+                                      dst_conn="in_con",
+                                      memlet=dace.Memlet("vec_data_C[m1]"))
+                state.add_memlet_path(mem_read,
+                                      entry_map,
+                                      add_map_entry,
+                                      add_C_tasklet,
+                                      dst_conn="prev_c",
+                                      memlet=dace.Memlet(
+                                          "C[m*{}+m1]".format(vec_width)))
+
+                # write out
+                state.add_memlet_path(add_C_tasklet,
+                                      add_map_exit,
+                                      vect_res,
+                                      src_conn="out_con",
+                                      memlet=dace.Memlet("vec_res[m1]"))
+                state.add_memlet_path(vect_res,
+                                      exit_map,
+                                      mem,
+                                      memlet=dace.Memlet("Y[n,m]"))
+
+            else:
+                tasklet = state.add_tasklet(
+                    "write_C", {"from_kernel", "prev_c"}, {"to_memory"},
+                    "to_memory = from_kernel + prev_c")
+                state.add_memlet_path(pipe,
+                                      entry_map,
+                                      tasklet,
+                                      dst_conn="from_kernel",
+                                      memlet=dace.Memlet(
+                                          "C_pipe[{}-1]".format(P)))
+                state.add_memlet_path(mem_read,
+                                      entry_map,
+                                      tasklet,
+                                      dst_conn="prev_c",
+                                      memlet=dace.Memlet("C[m]"))
+                state.add_memlet_path(tasklet,
+                                      exit_map,
+                                      mem,
+                                      src_conn="to_memory",
+                                      memlet=dace.Memlet("Y[n, m]"))
+
+
+        def make_compute(sdfg, state, vec_width=1):
+
+            vec_type = dace.vector(dace.float32, vec_width)
+            A_pipe_in = state.add_read("A_pipe")
+            # A_pipe_out = state.add_write("A_pipe")
+            B_pipe_in = state.add_read("B_pipe")
+            B_pipe_out = state.add_write("B_pipe")
+            C_pipe_in = state.add_read("C_pipe")
+            C_pipe_out = state.add_write("C_pipe")
+
+            entry_pipeline, exit_pipeline = state.add_pipeline(
+                "compute_and_drain",
+                {
+                    "n0": "0:{}/{}".format(N,P),
+                    "tm": "0:{}/{}".format(T, T),
+                    "k": "0:{}".format(K),
+                    "m": "0:{} + {}".format(
+                        T, L
+                    )
+                },
+                drain_size=P * T,
+                drain_overlap=False,
+                additional_iterators={'m_drain': 0, 'k_drain': 0},
+                schedule=dace.ScheduleType.FPGA_Device)
+
+            # Instantiate buffers
+            sdfg.add_scalar("A_reg",
+                            dtype=dace.float32,
+                            transient=True,
+                            storage=dace.dtypes.StorageType.FPGA_Registers)
+            A_reg = state.add_write("A_reg")
+            A_reg_init = state.add_access("A_reg")
+
+            # For C result we are going to use vectorized data type
+
+            # Note: for some of the Sacred Mysteries of Intel OpenCL Compiler (TM), if this buffer is smaller
+            # than 24 floats, the II of the pipeline will be 5. Therefore we check this (with 32 to be
+            # more compliant with standard vector size) and in case we enlarge it
+
+            buffer_size = max(T * vec_width, 32) /vec_width
+            sdfg.add_array("C_buffer", [buffer_size],
+                           dtype=vec_type,
+                           transient=True,
+                           storage=dace.dtypes.StorageType.FPGA_Local)
+            C_buffer_in = state.add_read("C_buffer")
+            C_buffer_out = state.add_write("C_buffer")
+
+            # Feed A
+            # every PE: reads input data, buffer the data assigned to it
+            buffer_a_tasklet = state.add_tasklet(
+                "buffer_a", {"a_in"}, {
+                    "a_reg",
+                }, """\
+if m == 0 and not {}:
+    a_reg = a_in""".format(entry_pipeline.pipeline.drain_condition()))
+            state.add_memlet_path(A_pipe_in,
+                                  entry_pipeline,
+                                  buffer_a_tasklet,
+                                  memlet=dace.Memlet("A_pipe[p]",
+                                                     dynamic=True),
+                                  dst_conn="a_in")
+            state.add_memlet_path(buffer_a_tasklet,
+                                  A_reg,
+                                  memlet=dace.Memlet("A_reg[0]", dynamic=True),
+                                  src_conn="a_reg")
+
+            # Feed B
+            # Read B: done outside of the compute tasklet to help type inference
+            sdfg.add_array("B_reg",
+                           shape=[1],
+                           dtype=vec_type,
+                           transient=True,
+                           storage=dace.dtypes.StorageType.FPGA_Local)
+            B_reg = state.add_access("B_reg")
+            buffer_b_tasklet = state.add_tasklet(
+                "buffer_b", {"b_in"}, {"b_reg_out"}, """\
+if  m>={} and not {}:
+    b_reg_out = b_in""".format(
+                    L, entry_pipeline.pipeline.drain_condition()))
+
+            state.add_memlet_path(B_pipe_in,
+                                  entry_pipeline,
+                                  buffer_b_tasklet,
+                                  memlet=dace.Memlet("B_pipe[p]", dynamic=True),
+                                  dst_conn="b_in")
+            state.add_memlet_path(buffer_b_tasklet,
+                                  B_reg,
+                                  memlet=dace.Memlet("B_reg[0]", dynamic=True),
+                                  src_conn="b_reg_out")
+            # COMPUTE AND DRAIN
+            # Compute and forward B: this is done if we are not in the init phase of the pipeline
+            compute_tasklet = state.add_tasklet(
+                "compute_and_drain",
+                {"a_in", "b_in", "c_in", "forward_in"},
+                {"b_out", "c_out", "c_pipe_out"}, f"""\
+if m>= {L} and not {entry_pipeline.pipeline.drain_condition()}:
+    c_prev = 0 if k == 0 else c_in     
+    c_out =  c_prev + a_in * b_in
+    if p < {P} - 1:
+        b_out = b_in
+# Drain
+# when we have to drain:
+# - if k = K-1 and m>=L: drain my own result
+#-  otherwise, if k_drain<p forward data coming from previous PEs (this could happens also in the drain phase)
+if((n0 > 0 or tm > 0)  and k_drain <p and m_drain <{T}) or  (k=={K}-1 and m>= {L}) or ({entry_pipeline.pipeline.drain_condition()} and k_drain < p):
+   c_pipe_out = c_out if (p==0 or (k_drain=={K}-1 and not {entry_pipeline.pipeline.drain_condition()})) else forward_in
+
+# adjust draining iterators
+if not {entry_pipeline.pipeline.drain_condition()}:
+    if m_drain >= {L} +  {T} -1:
+        m_drain = 0
+        if k_drain >= {K} - 1:
+            k_drain = 0
+        else:
+            k_drain = k_drain +1
+    else:
+        m_drain = m_drain + 1
+else:
+    if m_drain >=  {T} -1:
+        m_drain = 0
+        if k_drain >= {K} - 1:
+            k_drain = 0
+        else:
+            k_drain = k_drain +1
+    else:
+        m_drain = m_drain + 1
+            """)
+
+
+            state.add_memlet_path(A_reg,
+                                  compute_tasklet,
+                                  dst_conn="a_in",
+                                  memlet=dace.Memlet("A_reg[0]"))
+            state.add_memlet_path(B_reg,
+                                  compute_tasklet,
+                                  memlet=dace.Memlet("B_reg[0]",
+                                                     dynamic=False),
+                                  dst_conn="b_in")
+
+            state.add_memlet_path(compute_tasklet,
+                                  exit_pipeline,
+                                  B_pipe_out,
+                                  memlet=dace.Memlet("B_pipe[p + 1]",
+                                                     dynamic=True),
+                                  src_conn="b_out")
+            state.add_memlet_path(C_buffer_in,
+                                  entry_pipeline,
+                                  compute_tasklet,
+                                  dst_conn="c_in",
+                                  memlet=dace.Memlet("C_buffer[m-{}]".format(L), allow_oob=True))
+
+            state.add_memlet_path(compute_tasklet,
+                                  exit_pipeline,
+                                  C_buffer_out,
+                                  memlet=dace.Memlet("C_buffer[m-{}]".format(L), allow_oob=True, dynamic=True),
+                                  src_conn="c_out")
+
+            state.add_memlet_path(C_pipe_in,
+                                  entry_pipeline,
+                                  compute_tasklet,
+                                  memlet=dace.Memlet("C_pipe[p-1]",
+                                                     dynamic=True),
+                                  dst_conn="forward_in")
+            state.add_memlet_path(compute_tasklet,
+                                  exit_pipeline,
+                                  C_pipe_out,
+                                  memlet=dace.Memlet("C_pipe[p]",
+                                                     dynamic=True),
+                                  src_conn="c_pipe_out")
+
+            # Unroll processing elements
+            compute_entry, compute_exit = state.add_map(
+                "unroll_compute", {"p": "0:{}".format(P)},
+                schedule=dace.ScheduleType.FPGA_Device,
+                unroll=True)
+
+            # Bring data nodes into scope
+            state.add_memlet_path(compute_entry,
+                                  A_pipe_in,
+                                  memlet=dace.memlet.Memlet())
+            state.add_memlet_path(compute_entry,
+                                  B_pipe_in,
+                                  memlet=dace.memlet.Memlet())
+            state.add_memlet_path(compute_entry,
+                                  C_pipe_in,
+                                  memlet=dace.memlet.Memlet())
+            # state.add_memlet_path(A_pipe_out,
+            #                       compute_exit,
+            #                       memlet=dace.memlet.Memlet())
+            state.add_memlet_path(B_pipe_out,
+                                  compute_exit,
+                                  memlet=dace.memlet.Memlet())
+            state.add_memlet_path(C_pipe_out,
+                                  compute_exit,
+                                  memlet=dace.memlet.Memlet())
+
+            state.add_memlet_path(compute_entry,
+                                  A_reg_init,
+                                  memlet=dace.memlet.Memlet())
+            state.add_memlet_path(A_reg_init,
+                                  entry_pipeline,
+                                  memlet=dace.memlet.Memlet())
+            b_init = state.add_access("B_reg")
+            state.add_memlet_path(compute_entry,
+                                  b_init,
+                                  memlet=dace.Memlet())
+            state.add_memlet_path(b_init,
+                                  entry_pipeline,
+                                  memlet=dace.Memlet())
+            state.add_memlet_path(compute_entry,
+                                  C_buffer_in,
+                                  memlet=dace.Memlet())
+
+
+        # build the compute State
+        vec_type = dace.vector(dace.float32, vec_width)
+
+        new_sdfg.add_stream("A_pipe",
+                            dace.float32,
+                            transient=True,
+                            shape=(P, ),
+                            storage=dace.dtypes.StorageType.FPGA_Local,
+                            buffer_size=str(P))
+        new_sdfg.add_stream("B_pipe",
+                            vec_type,
+                            transient=True,
+                            shape=(P + 1, ),
+                            buffer_size=2,
+                            storage=dace.dtypes.StorageType.FPGA_Local)
+        new_sdfg.add_stream("C_pipe",
+                            vec_type,
+                            transient=True,
+                            shape=(P + 1, ),
+                            buffer_size=T,
+                            storage=dace.dtypes.StorageType.FPGA_Local)
+
+        make_read_A(new_state)
+        make_read_B(new_state, new_sdfg, vec_width)
+        make_compute(new_sdfg, new_state, vec_width)
+        make_write_C(new_state, new_sdfg, vec_width)
+
+        new_sdfg.fill_scope_connectors()
+        # Specialize the new sdfg, by using the input shapes
+        new_sdfg.save("/tmp/gemm.sdfg")
+        new_sdfg.validate()
+
+        # nest the sdfg and map symbols
+        symbol_mapping = {
+            "batch_size": A.shape[0],
+            "input_features": A.shape[1],
+            "output_features": Y.shape[1],
+        }
+
+        expansion = state.add_nested_sdfg(new_sdfg,
+                                          sdfg,
+                                          node.in_connectors,
+                                          node.out_connectors,
+                                          name=node.name,
+                                          debuginfo=node.debuginfo,
+                                          symbol_mapping=symbol_mapping)
+
+        expansion.sdfg.save('/tmp/expansion.sdfg')
+        return expansion
+
