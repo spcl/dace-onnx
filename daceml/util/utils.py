@@ -84,7 +84,7 @@ def vectorize_array_and_memlet(sdfg, array_name, type: dtypes.typeclass):
     if not symbolic.issymbolic(data.shape[-1]) and data.shape[-1] % vec_width != 0:
         raise ValueError("Shape of {} is not divisible by {}".format(
             data, vec_width))
-    data.shape = data.shape[:-1] + (data.shape[-1] / vec_width, )
+    data.shape = data.shape[:-1] + ((int(data.shape[-1] / vec_width), ) if not symbolic.issymbolic(data.shape[-1]) else (data.shape[-1] / vec_width), )
 
     # #adjust all the strides
     for stride in data.strides[:-1]:
@@ -92,7 +92,7 @@ def vectorize_array_and_memlet(sdfg, array_name, type: dtypes.typeclass):
             raise ValueError("Stride of {} is not divisible by {}".format(
                 data.name, vec_width))
 
-    data.strides = tuple(ti / vec_width
+    data.strides = tuple(int(ti / vec_width) if not symbolic.issymbolic(ti) else ti/vec_width
                          for ti in data.strides[:-1]) + (data.strides[-1], )
 
     # Search for all the memlets
