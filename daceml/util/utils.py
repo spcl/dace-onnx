@@ -84,7 +84,12 @@ def vectorize_array_and_memlet(sdfg, array_name, type: dtypes.typeclass):
     if not symbolic.issymbolic(data.shape[-1]) and data.shape[-1] % vec_width != 0:
         raise ValueError("Shape of {} is not divisible by {}".format(
             data, vec_width))
-    data.shape = data.shape[:-1] + ((int(data.shape[-1] / vec_width), ) if not symbolic.issymbolic(data.shape[-1]) else (data.shape[-1] / vec_width), )
+    old_shape = data.shape
+    data.shape = old_shape[:-1]
+    if not symbolic.issymbolic(data.shape[-1]):
+        data.shape = data.shape + (int(old_shape[-1] / vec_width), )
+    else:
+        data.shape = data.shape + ((old_shape[-1] / vec_width), )
 
     # #adjust all the strides
     for stride in data.strides[:-1]:
