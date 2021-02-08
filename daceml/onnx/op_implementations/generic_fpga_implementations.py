@@ -562,10 +562,11 @@ class FPGAGemm(ONNXForward):
 
 
         P = 8 # Number of Processing Elements
-        T = 84 # Tile size
+        T = 84 # Tile size, not considering vectorization width (so plain floats)
         vec_width = Y.veclen
+        assert(T%vec_width==0)
         # TODO:implement
-        assert vec_width == 1
+        # assert vec_width == 1
 
         #safe delay
         L = max(11 - T, 0)
@@ -579,7 +580,7 @@ class FPGAGemm(ONNXForward):
             # TODO: vectorize also this, by reading more than one element at a time
             entry, exit = state.add_map("read_A", {
                 "n0": "0:{}/{}".format(N, P),
-                "tm": "0:{}/{}".format(M, T),  # must be repeated according to the tile size
+                "tm": "0:{}*{}/{}".format(M, vec_width, T),  # must be repeated according to the tile size
                 "k": "0:{}".format(K)
             },
                                         schedule=dace.ScheduleType.FPGA_Device)
@@ -620,14 +621,14 @@ class FPGAGemm(ONNXForward):
             # Therefore we have two maps, the innermost is unrolled
             entry, exit = state.add_map("read_B", {
                 "n": "0:{}/{}".format(N, P),
-                "tm": "0:{}/{}".format(M, T),
-                "m": "0:{}".format(K),
-                "k0": "0:{}/{}".format(M, vec_width)
+                "tm": "0:{}*{}/{}".format(M, vec_width, T), #consider vec_width
+                "k": "0:{}".format(K),
+                "m0": "0:{}/{}".format(T, vec_width)
             },
                                         schedule=dace.ScheduleType.FPGA_Device)
 
             read_map_entry, read_map_exit = state.add_map(
-                "unrolled_reads_B", {"k1": "0:{}".format(vec_width)},
+                "unrolled_reads_B", {"m1": "0:{}".format(vec_width)},
                 schedule=dace.ScheduleType.FPGA_Device,
                 unroll=True)
 
@@ -651,13 +652,13 @@ class FPGAGemm(ONNXForward):
                                   tasklet,
                                   dst_conn="from_memory",
                                   memlet=dace.Memlet(
-                                      "B[k0*{}+k1, tm*{} + m]".format(vec_width, T)))
+                                      "B[tm*{} +m0*{}+m1, k]".format(T, vec_width)))
 
             state.add_memlet_path(tasklet,
                                   read_map_exit,
                                   vect_data,
                                   src_conn="to_kernel",
-                                  memlet=dace.Memlet("vec_data_B[k1]"))
+                                  memlet=dace.Memlet("vec_data_B[m1]"))
 
             # then we transfer them to the output stream
             copy_out_tasklet = state.add_tasklet('pack_and_copy_to_stream_B',
@@ -695,9 +696,10 @@ class FPGAGemm(ONNXForward):
             entry_map, exit_map = state.add_map(
                 "write_C",
                 {
-                    "n": "0:{}".format(N),
-                    "tm": "0:{}/{}".format(M, T),
-                    "m": "0:{}".format(T)  #consider also vectorization
+                    "n0": "0:{}/{}".format(N,P),
+                    "tm": "0:{}*{}/{}".format(M,vec_width, T),
+                    "n1": "0:{}".format(P),
+                    "m": "0:{}/{}".format(T, vec_width)  #consider also vectorization
                 },
                 schedule=dace.ScheduleType.FPGA_Device)
 
@@ -770,7 +772,7 @@ class FPGAGemm(ONNXForward):
                 state.add_memlet_path(vect_res,
                                       exit_map,
                                       mem,
-                                      memlet=dace.Memlet("Y[n,m]"))
+                                      memlet=dace.Memlet("Y[n0*{}+n1,m]".format(P)))
 
             else:
                 tasklet = state.add_tasklet(
@@ -791,7 +793,7 @@ class FPGAGemm(ONNXForward):
                                       exit_map,
                                       mem,
                                       src_conn="to_memory",
-                                      memlet=dace.Memlet("Y[n, m]"))
+                                      memlet=dace.Memlet("Y[n0*{}+n1, m]".format(P)))
 
 
         def make_compute(sdfg, state, vec_width=1):
@@ -807,14 +809,14 @@ class FPGAGemm(ONNXForward):
             entry_pipeline, exit_pipeline = state.add_pipeline(
                 "compute_and_drain",
                 {
-                    "n0": "0:{}/{}".format(N,P),
-                    "tm": "0:{}/{}".format(T, T),
+                    "n0": "0:{}/{}".format(N, P),
+                    "tm": "0:{}*{}/{}".format(M, vec_width, T), #if this is vectorized, M accounts for that
                     "k": "0:{}".format(K),
-                    "m": "0:{} + {}".format(
-                        T, L
+                    "m": "0:{}/{} + {}".format(
+                        T, vec_width, L
                     )
                 },
-                drain_size=P * T,
+                drain_size=P * T//vec_width,
                 drain_overlap=False,
                 additional_iterators={'m_drain': 0, 'k_drain': 0},
                 schedule=dace.ScheduleType.FPGA_Device)
@@ -833,7 +835,7 @@ class FPGAGemm(ONNXForward):
             # than 24 floats, the II of the pipeline will be 5. Therefore we check this (with 32 to be
             # more compliant with standard vector size) and in case we enlarge it
 
-            buffer_size = max(T * vec_width, 32) /vec_width
+            buffer_size = max(T, 32) /vec_width
             sdfg.add_array("C_buffer", [buffer_size],
                            dtype=vec_type,
                            transient=True,
@@ -903,7 +905,7 @@ if((n0 > 0 or tm > 0)  and k_drain <p and m_drain <{T}) or  (k=={K}-1 and m>= {L
 
 # adjust draining iterators
 if not {entry_pipeline.pipeline.drain_condition()}:
-    if m_drain >= {L} +  {T} -1:
+    if m_drain >= {L} +  {T}/{vec_width} -1:
         m_drain = 0
         if k_drain >= {K} - 1:
             k_drain = 0
@@ -912,7 +914,7 @@ if not {entry_pipeline.pipeline.drain_condition()}:
     else:
         m_drain = m_drain + 1
 else:
-    if m_drain >=  {T} -1:
+    if m_drain >=  {T}/{vec_width} -1:
         m_drain = 0
         if k_drain >= {K} - 1:
             k_drain = 0

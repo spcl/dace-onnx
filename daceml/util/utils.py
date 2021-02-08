@@ -5,6 +5,7 @@ from dace.sdfg.state import MultiConnectorEdge
 from dace import SDFG, SDFGState
 import dace.data as dt
 from dace import dtypes
+from dace import symbolic
 
 
 def in_desc_with_name(node: Node, state: SDFGState, sdfg: SDFG,
@@ -79,18 +80,19 @@ def vectorize_array_and_memlet(sdfg, array_name, type: dtypes.typeclass):
 
     #adjust the shape
     vec_width = type.veclen
-    if data.shape[-1] % vec_width != 0:
+    # if not symbolic, check that is divisble
+    if not symbolic.issymbolic(data.shape[-1]) and data.shape[-1] % vec_width != 0:
         raise ValueError("Shape of {} is not divisible by {}".format(
             data, vec_width))
-    data.shape = data.shape[:-1] + (data.shape[-1] // vec_width, )
+    data.shape = data.shape[:-1] + (data.shape[-1] / vec_width, )
 
     # #adjust all the strides
     for stride in data.strides[:-1]:
-        if stride % vec_width != 0:
+        if not symbolic.issymbolic(stride) and stride % vec_width != 0:
             raise ValueError("Stride of {} is not divisible by {}".format(
                 data.name, vec_width))
 
-    data.strides = tuple(ti // vec_width
+    data.strides = tuple(ti / vec_width
                          for ti in data.strides[:-1]) + (data.strides[-1], )
 
     # Search for all the memlets
@@ -102,11 +104,11 @@ def vectorize_array_and_memlet(sdfg, array_name, type: dtypes.typeclass):
 
                 # Let's be conservative for the moment
 
-                if start != 0 or skip != 1 or (stop + 1) % vec_width != 0:
+                if start != 0 or skip != 1 or (not symbolic.issymbolic(stop) and (stop + 1) % vec_width != 0):
                     raise ValueError(
                         "Memlet {} not able to convert its range".format(
                             edge.data))
 
                 #update the range
-                new_stop = (stop + 1) // vec_width - 1
+                new_stop = (stop + 1) / vec_width - 1
                 edge.data.subset.ranges[-1] = (start, new_stop, skip)
