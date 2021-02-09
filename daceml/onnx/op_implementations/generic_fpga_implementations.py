@@ -75,9 +75,6 @@ class FPGARelu(ONNXForward):
         X = in_desc_with_name(node, state, sdfg, "X")
         Y = out_desc_with_name(node, state, sdfg, "Y")
 
-        if len(X.shape) != 4:
-            return False
-
         # TODO: For the moment being, we support the same vect width
         if X.veclen != Y.veclen:
             return False
@@ -104,41 +101,46 @@ class FPGARelu(ONNXForward):
         # be mapped to external ones
 
         new_sdfg = dace.SDFG("fpga_relu")
-        map_ranges = {
-            '__i0': "0:batch_size",
-            '__i1': "0:input_channels",
-            '__i2': "0:input_height",
-            '__i3': "0:input_width"
-        }
-        batch_size = dace.symbol("batch_size")
-        input_channels = dace.symbol("input_channels")
-        input_height = dace.symbol("input_height")
-        input_width = dace.symbol("input_width")
-        new_state = new_sdfg.add_state("compute")
-        new_sdfg.add_symbol(batch_size.name, dace.int32)
-        new_sdfg.add_symbol(input_channels.name, dace.int32)
-        new_sdfg.add_symbol(input_height.name, dace.int32)
-        new_sdfg.add_symbol(input_width.name, dace.int32)
+        # Build symbolic map ranges, shape and strides: one loop per dimension
+        # We use internal symbols
+        map_ranges = dict()
+        x_shape = []
+        x_strides = []
+        axis_names = []
 
+        for i, n in enumerate(X.shape):
+            axis_name = "relu_axis{}".format(i)
+            axis_names.append(axis_name)
+            map_ranges[f"__i{i}"] = f"0:{axis_name}"
+            # add the symbol
+            symbolic_axis = dace.symbol(axis_name)
+            new_sdfg.add_symbol(symbolic_axis.name, dace.int32)
+            # keep track of shapes and strides
+            # note that the stride looks like [relu_axis1*relu_axis2, relu_axis2, 1]
+            x_shape.append(symbolic_axis)
+            x_strides.append(1)
+            for j in range(i):
+                x_strides[j] = x_strides[j] * symbolic_axis
+
+        y_shape = x_shape
+        y_strides = x_strides
+
+        new_state = new_sdfg.add_state("compute")
         # Create local versions of input data nodes, but using our new symbols, not the real ones
         # in order to not use external shapes. Later we will do symbol mapping
-        new_sdfg.add_array(
-            "X",
-            shape=(batch_size, input_channels, input_height, input_width),
-            dtype=X.dtype,
-            storage=X.storage,
-            strides=(input_channels * input_height * input_width,
-                     input_height * input_width, input_width, 1),
-            transient=False)
+        new_sdfg.add_array("X",
+                           shape=x_shape,
+                           dtype=X.dtype,
+                           storage=X.storage,
+                           strides=x_strides,
+                           transient=False)
 
-        new_sdfg.add_array(
-            "Y",
-            shape=(batch_size, input_channels, input_height, input_width),
-            dtype=Y.dtype,
-            storage=Y.storage,
-            strides=(input_channels * input_height * input_width,
-                     input_height * input_width, input_width, 1),
-            transient=False)
+        new_sdfg.add_array("Y",
+                           shape=y_shape,
+                           dtype=Y.dtype,
+                           storage=Y.storage,
+                           strides=y_strides,
+                           transient=False)
 
         outer_me, outer_mx = new_state.add_map('relu_map', map_ranges)
 
@@ -244,10 +246,8 @@ class FPGARelu(ONNXForward):
         new_sdfg.save("/tmp/newsdfg.sdfg")
 
         # nest and map symbol
-        symbol_mapping["batch_size"] = X.shape[0]
-        symbol_mapping["input_channels"] = X.shape[1]
-        symbol_mapping["input_height"] = X.shape[2]
-        symbol_mapping["input_width"] = X.shape[3]
+        for i, n in enumerate(X.shape):
+            symbol_mapping[axis_names[i]] = n
 
         expansion = state.add_nested_sdfg(new_sdfg,
                                           sdfg,
@@ -770,10 +770,8 @@ to_kernel = data """.format(T, vec_width, M))
                                       memlet=dace.Memlet("vec_data_C"))
 
                 # add C
-                add_C_tasklet = state.add_tasklet('add_C_tasklet',
-                                                  {'in_con', 'prev_c'},
-                                                  {'out_con'},
-                                                  """\
+                add_C_tasklet = state.add_tasklet(
+                    'add_C_tasklet', {'in_con', 'prev_c'}, {'out_con'}, """\
 if tm * {} + m * {} + m1 < {}:                                               
     out_con = in_con + prev_c """.format(T, vec_width, M))
                 state.add_memlet_path(vect_data,
@@ -787,7 +785,9 @@ if tm * {} + m * {} + m1 < {}:
                                       add_C_tasklet,
                                       dst_conn="prev_c",
                                       memlet=dace.Memlet(
-                                          "C[tm*{} + m*{} + m1]".format(T, vec_width), dynamic=True))
+                                          "C[tm*{} + m*{} + m1]".format(
+                                              T, vec_width),
+                                          dynamic=True))
 
                 state.add_memlet_path(add_C_tasklet,
                                       add_map_exit,
@@ -797,28 +797,28 @@ if tm * {} + m * {} + m1 < {}:
                 # write out: we have to write out only if we are not after M
                 # here we exploit the fact that M%vec_width == 0 (By construction, see above)
                 # we need an additional tasklet, so that we can have the dynamic memlet
-                write_tasklet = state.add_tasklet('write',
-                                                 {'in_con'},
-                                                 {'out_con'},
-                                                 """\
+                write_tasklet = state.add_tasklet(
+                    'write', {'in_con'}, {'out_con'}, """\
 if tm * {} + m * {}  < {}:
     out_con = in_con""".format(T, vec_width, M))
                 state.add_memlet_path(vect_res,
                                       write_tasklet,
                                       dst_conn="in_con",
-                                      memlet=dace.Memlet("vec_res[0:{}]".format(vec_width)))
+                                      memlet=dace.Memlet(
+                                          "vec_res[0:{}]".format(vec_width)))
 
                 state.add_memlet_path(write_tasklet,
                                       exit_map,
                                       mem,
                                       src_conn="out_con",
                                       memlet=dace.Memlet(
-                                          "Y[n0*{}+n1, tm*{}/{} + m]".format(P,T,vec_width), dynamic=True))
+                                          "Y[n0*{}+n1, tm*{}/{} + m]".format(
+                                              P, T, vec_width),
+                                          dynamic=True))
 
             else:
                 tasklet = state.add_tasklet(
-                    "write_C", {"from_kernel", "prev_c"}, {"to_memory"},
-                    """\
+                    "write_C", {"from_kernel", "prev_c"}, {"to_memory"}, """\
 if tm * {} + m < {}:                 
     to_memory = (from_kernel + prev_c)""".format(T, M))
                 state.add_memlet_path(pipe,
@@ -831,13 +831,16 @@ if tm * {} + m < {}:
                                       entry_map,
                                       tasklet,
                                       dst_conn="prev_c",
-                                      memlet=dace.Memlet("C[tm*{} + m]".format(T), dynamic=True))
-                state.add_memlet_path(tasklet,
-                                      exit_map,
-                                      mem,
-                                      src_conn="to_memory",
                                       memlet=dace.Memlet(
-                                          "Y[n0*{}+n1, tm*{} + m]".format(P,T), dynamic=True))
+                                          "C[tm*{} + m]".format(T),
+                                          dynamic=True))
+                state.add_memlet_path(
+                    tasklet,
+                    exit_map,
+                    mem,
+                    src_conn="to_memory",
+                    memlet=dace.Memlet("Y[n0*{}+n1, tm*{} + m]".format(P, T),
+                                       dynamic=True))
 
         def make_compute(sdfg, state, vec_width=1):
 
