@@ -500,7 +500,6 @@ class FPGAIm2ColConv(ONNXForward):
         P = num_filters  # Num PEs  #TODO parametric
         #safe delay
         L = max(11 - M, 0)
-
         def make_read_W(state):
             # this will read the weights, organized as a matrix of size
             # num_filters x (num_channels * filter_hx * filter_hy)
@@ -568,8 +567,7 @@ class FPGAIm2ColConv(ONNXForward):
                     "hx": "0:{}".format(filter_hx),
                     "hy": "0:{}".format(filter_hy),
                     "x": "0:{}".format(output_size_x),
-                    "y0": "0:{}/{}".format(output_size_x,
-                                           vec_width),  #TODO vectorize read
+                    "y0": "0:{}".format(output_size_y),  #TODO vectorize read
                 },
                 schedule=dace.ScheduleType.FPGA_Device)
 

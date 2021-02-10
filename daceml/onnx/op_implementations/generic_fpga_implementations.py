@@ -606,11 +606,10 @@ class FPGAGemm(ONNXForward):
         T = 16  # Tile size, not considering vectorization width (so plain floats)
 
         assert (T % vec_width == 0)
-        # TODO:implement
-        # assert vec_width == 1
 
-        #safe delay
-        L = max(11 - T, 0)
+        #safe delay: apparently, we should wait at least 11 cycles to add on the same floating number
+        # stored in BRAM (6 clock cycle for the madd, 4 clock cycles for accessing BRAM)
+        L = max(11 - T//vec_width, 0)
 
         ####################################################
         # Build the SDFG: starting point: gemm_fpga_systolic vectorized sample
@@ -630,7 +629,7 @@ class FPGAGemm(ONNXForward):
                 },
                 schedule=dace.ScheduleType.FPGA_Device)
             # use a different map, and unroll it if necessary
-            unroll_inner_map = P > (T + L) and P <= 16
+            unroll_inner_map = P > (T//vec_width + L) and P <= 16
             send_map_entry, send_map_exit = state.add_map(
                 "send_A", {"n1": "0:{}".format(P)},
                 schedule=dace.ScheduleType.FPGA_Device,
@@ -1144,6 +1143,7 @@ class FPGAGenericIm2ColConv(ONNXForward):
     - it assumes that tile_size % vec_width == 0 (if that is not the case we should also read from memory not just write)
     - it properly deals with the case in which some PE does nothing
 
+
     """
     @staticmethod
     def forward_can_be_applied(node: ONNXOp, state: SDFGState,
@@ -1236,7 +1236,6 @@ class FPGAGenericIm2ColConv(ONNXForward):
         new_sdfg.add_symbol(input_size_x.name, dace.int32)
         new_sdfg.add_symbol(input_size_y.name, dace.int32)
 
-        # TODO complete
         symbol_mapping = {
             batch_size.name: X.shape[0],
             num_channels.name: X.shape[1],
@@ -1256,26 +1255,6 @@ class FPGAGenericIm2ColConv(ONNXForward):
         Y_shape, Y_strides = derive_shape_and_strides_for_symbolic_data(
             Y, [batch_size, num_filters, output_size_y, output_size_x])
         new_state = new_sdfg.add_state()
-
-        # num_filters = W.shape[0]
-        # num_channels = X.shape[1]
-        # batch_size = X.shape[0]
-        #
-        # # Take output size: note, tat this accounts for vectorization (if present)
-        # output_size_x, output_size_y = Y.shape[2:]
-        # setup inputs and outputs
-
-        # new_sdfg.add_datadesc("X", copy.deepcopy(X))
-        #
-        # new_sdfg.add_datadesc("W", copy.deepcopy(W))
-        # new_sdfg.add_datadesc("Y", copy.deepcopy(Y))
-        # if B is not None:
-        #     new_sdfg.add_datadesc("B", copy.deepcopy(B))
-        #     new_sdfg.arrays["B"].transient = False
-        #
-        # new_sdfg.arrays["X"].transient = False
-        # new_sdfg.arrays["W"].transient = False
-        # new_sdfg.arrays["Y"].transient = False
 
         # Create local versions of input data nodes, but using our new symbols, not the real ones
         # in order to not use external shapes and complicated formulas that could pop out from shape inference.
@@ -1306,7 +1285,7 @@ class FPGAGenericIm2ColConv(ONNXForward):
                                strides=B_strides,
                                transient=False)
 
-        # GEMM Parameters
+        # GEMM Parameters: it is the output that is vectorized
         vec_width = Y.veclen
 
         # TODO: accept parametric?
@@ -1314,19 +1293,19 @@ class FPGAGenericIm2ColConv(ONNXForward):
         #if Y.veclen !=1 else math.gcd(16, output_size_x)
         #N = num_filters
         K = num_channels * filter_hx * filter_hy
-        M = output_size_y * output_size_x * vec_width  # in plain data format
+        M = output_size_y * output_size_x * vec_width  # number of output elements (plain data, not vectorized)
 
-        # Computational unit parameter:
+        # Computational unit parameters:
         # - #PEs (optimal number is the number of filters)
         # - Tile size T (optimal number is M)
-        P = 6  # Num PEs  #TODO parametric
-        T = 24*24
+        P = 6 # Num PEs  #TODO parametric
+        T = 16 # expressed in plain elements
         assert (T % vec_width == 0)
-        assert (
-            vec_width == 1
-        )  # if this is not the case, take care of the value of out_x, out_y
-        #safe delay
-        L = max(11 - T, 0)
+
+
+        #safe delay: we should wait 11 clock cycles before adding again into the same floating point number
+        # stored in BRAM
+        L = max(11 - T//vec_width, 0)
 
         def make_read_W(state):
             # this will read the weights, organized as a matrix of size
@@ -1351,7 +1330,7 @@ class FPGAGenericIm2ColConv(ONNXForward):
                 schedule=dace.ScheduleType.FPGA_Device)
 
             # use a different map, and unroll it if necessary
-            unroll_inner_map = P > (T + L) and P <= 16
+            unroll_inner_map = P > (T//vec_width + L) and P <= 16
             send_map_entry, send_map_exit = state.add_map(
                 "send_weights", {"n1": "0:{}".format(P)},
                 schedule=dace.ScheduleType.FPGA_Device,
@@ -1397,7 +1376,7 @@ to_kernel = data
                     "n": "0:ceiling({}/{})".format(
                         num_filters, P),  # repeat B for computing the result
                     "tm": "0:ceiling({}/{})".format(
-                        M, T),  # M already consider vec_width
+                        M, T),  # M already consider vec_width,
                     "cin": "0:{}".format(num_channels),
                     "hy": "0:{}".format(filter_hy),
                     "hx": "0:{}".format(
@@ -1436,10 +1415,8 @@ to_kernel = data
             #     "X[b, cin, y + hy, x0*{}+x1 + hx]".format(vec_width))
             # report everything to x, y: notice the integer division with int_floor
             im2col_input_memlet = dace.Memlet(
-                f"X[b, cin, int_floor((tm*{T} + m0*{vec_width} + m1),{output_size_x}) + hy, (tm*{T} + m0*{vec_width} + m1)%{output_size_x} + hx]",
+                f"X[b, cin, int_floor((tm*{T/vec_width} + m0),{output_size_x}) + hy, ((tm*{T/vec_width} + m0)%{output_size_x})*{vec_width} + m1 + hx]",
                 dynamic=True)
-
-            # TODO check that offset to X are right in the codegenerated code
 
             # In the innermost map we read W=vec_width data elements and we store them into `vec_data`
             state.add_memlet_path(X,
@@ -1489,7 +1466,7 @@ to_kernel = data
                     "n0": "0:ceiling({}/{})".format(num_filters, P),
                     "tm": "0:ceiling({}/{})".format(M, T),
                     "n1": "0:{}".format(P),
-                    "m": "0:{}".format(T)
+                    "m": "0:{}/{}".format(T, vec_width)
                     # "y": "0:{}".format(output_size_y),
                     # "x": "0:{}".format(output_size_x)
                 },
@@ -1504,8 +1481,8 @@ to_kernel = data
             # and that we are receiving data from a PE that is doing useful work
             copy__add_bias__tasklet = state.add_tasklet(
                 'copy_from_stream_Y', input_connectors, {'out_con'}, """\
-if tm * {} + m < {} and  n0*{}+n1 < {}: 
-    out_con = in_con {}""".format(T, M, P,  num_filters, "+ bias" if add_bias is True else ""))
+if tm * {} + m * {} < {} and  n0*{}+n1 < {}: 
+    out_con = in_con {}""".format(T, vec_width, M, P,  num_filters, "+ bias" if add_bias is True else ""))
 
             state.add_memlet_path(pipe,
                                   entry_map,
@@ -1532,7 +1509,7 @@ if tm * {} + m < {} and  n0*{}+n1 < {}:
                 mem,
                 src_conn="out_con",
                 memlet=dace.Memlet(
-                    f"Y[b, n0*{P}+n1,  int_floor(tm*{T} + m, {output_size_y}), (tm*{T}+m)%{output_size_y}]",
+                    f"Y[b, n0*{P}+n1,  int_floor(tm*{T} + m*{vec_width}, {output_size_y}), (tm*{T}+m*{vec_width})%{output_size_y}//{vec_width}]",
                     dynamic=True))
 
         def make_compute(sdfg, state, vec_width=1):
@@ -1560,7 +1537,7 @@ if tm * {} + m < {} and  n0*{}+n1 < {}:
                     #considering the latency for updating the same result (not just the FP32 multiply add, but
                     # also for reading/writing
                 },
-                drain_size=P * M,
+                drain_size=P * T//vec_width,
                 drain_overlap=False,
                 additional_iterators={
                     'm_drain': 0,
@@ -1576,10 +1553,15 @@ if tm * {} + m < {} and  n0*{}+n1 < {}:
             W_reg_init = state.add_access("W_reg")
             W_reg = state.add_access("W_reg")
 
+            # Note: for some of the Sacred Mysteries of Intel OpenCL Compiler (TM), if this buffer is smaller
+            # than 24 floats, the II of the pipeline will be 5. Therefore we check this (with 32 to be
+            # more compliant with standard vector size) and in case we enlarge it
+
+            buffer_size = max(T, 32) / vec_width
             # For C result we are going to use vectorized data type
             sdfg.add_array(
                 "Y_buffer",
-                [M],  #M already accounts for vec width
+                [buffer_size],  #M already accounts for vec width
                 dtype=vec_type,
                 transient=True,
                 storage=dace.dtypes.StorageType.FPGA_Local)
@@ -1646,10 +1628,7 @@ if m>= {L} and not {entry_pipeline.pipeline.drain_condition()}:
 # when we have to drain:
 # - if k = K-1 and m>=L: drain my own result
 #-  otherwise, if k_drain<p forward data coming from previous PEs (this could happens also in the drain phase)
-if((b>0  or n0 > 0 or tm > 0)  and k_drain <p and m_drain <{M}) or  (k=={K}-1 and m>= {L}) or ({entry_pipeline.pipeline.drain_condition()} and k_drain < p):
-    # if p!=0 and (k_drain != {K}-1 or {entry_pipeline.pipeline.drain_condition()}):
-    #     tmp = forward_in
-    # y_pipe_out = tmp
+if((b>0  or n0 > 0 or tm > 0)  and k_drain <p and m_drain <{T}/{vec_width}) or  (k=={K}-1 and m>= {L}) or ({entry_pipeline.pipeline.drain_condition()} and k_drain < p):
     y_pipe_out = y_out if (p==0 or (k_drain=={K}-1 and not {entry_pipeline.pipeline.drain_condition()})) else forward_in
 
 # adjust draining iterators
@@ -1778,7 +1757,7 @@ else:
                             vec_type,
                             transient=True,
                             shape=(P + 1, ),
-                            buffer_size=M,
+                            buffer_size=T,
                             storage=dace.dtypes.StorageType.FPGA_Local)
 
         make_read_W(new_state)
