@@ -532,6 +532,7 @@ class FPGAGemm(ONNXForward):
         - it properly deal with input that are not perfect multiple of them. If this is the case
             it will compute random data that will be not written in memory
         - it assumes that tile_size % vec_width == 0 (if that is not the case we should also read from memory not just write)
+        - it assumes that M % vec_width ==0
 
 
         ATTENTION:
@@ -640,7 +641,7 @@ class FPGAGemm(ONNXForward):
             entry, exit = state.add_map(
                 "read_A",
                 {
-                    "n0": "0:{}/{}".format(N, P),
+                    "n0": "0:ceiling({}/{})".format(N, P),
                     "tm": "0:ceiling({}/{})".format(
                         M, T),  # must be repeated according to the tile size
                     "k": "0:{}".format(K)
@@ -656,8 +657,9 @@ class FPGAGemm(ONNXForward):
             mem = state.add_read("A")
             pipe = state.add_write("A_pipe")
             tasklet = state.add_tasklet("read_A", {"from_memory"},
-                                        {"to_kernel"},
-                                        "to_kernel = from_memory")
+                                        {"to_kernel"},"""\
+data = from_memory if n0*{} + n1 < {} else 0
+to_kernel = from_memory""".format(P,N))
 
             state.add_memlet_path(mem,
                                   entry,
@@ -665,7 +667,7 @@ class FPGAGemm(ONNXForward):
                                   tasklet,
                                   dst_conn="from_memory",
                                   memlet=dace.Memlet(
-                                      "A[n0 * {} + n1, k]".format(P)))
+                                      "A[n0 * {} + n1, k]".format(P), dynamic=True, allow_oob=True))
             state.add_memlet_path(tasklet,
                                   send_map_exit,
                                   exit,
@@ -684,7 +686,7 @@ class FPGAGemm(ONNXForward):
             entry, exit = state.add_map(
                 "read_B",
                 {
-                    "n": "0:{}/{}".format(N, P),
+                    "n": "0:ceiling({}/{})".format(N, P),
                     "tm": "0:ceiling({}/{})".format(
                         M, T),  # M already consider vec_width
                     "k": "0:{}".format(K),
@@ -763,7 +765,7 @@ to_kernel = data """.format(T, vec_width, M))
             entry_map, exit_map = state.add_map(
                 "write_C",
                 {
-                    "n0": "0:{}/{}".format(N, P),
+                    "n0": "0:ceiling({}/{})".format(N, P),
                     "tm": "0:ceiling({}/{})".format(M, T),
                     "n1": "0:{}".format(P),
                     "m": "0:{}/{}".format(
@@ -814,8 +816,8 @@ to_kernel = data """.format(T, vec_width, M))
                 # add C
                 add_C_tasklet = state.add_tasklet(
                     'add_C_tasklet', {'in_con', 'prev_c'}, {'out_con'}, """\
-if tm * {} + m * {} + m1 < {}:                                               
-    out_con = in_con + prev_c """.format(T, vec_width, M))
+if tm * {} + m * {} + m1 < {}  and  n0*{}+n1 < {} :                                               
+    out_con = in_con + prev_c """.format(T, vec_width, M, P, N))
                 state.add_memlet_path(vect_data,
                                       add_map_entry,
                                       add_C_tasklet,
@@ -841,8 +843,8 @@ if tm * {} + m * {} + m1 < {}:
                 # we need an additional tasklet, so that we can have the dynamic memlet
                 write_tasklet = state.add_tasklet(
                     'write', {'in_con'}, {'out_con'}, """\
-if tm * {} + m * {}  < {}:
-    out_con = in_con""".format(T, vec_width, M))
+if tm * {} + m * {}  < {}  and  n0*{}+n1 < {}:
+    out_con = in_con""".format(T, vec_width, M, P, N))
                 state.add_memlet_path(vect_res,
                                       write_tasklet,
                                       dst_conn="in_con",
@@ -861,8 +863,8 @@ if tm * {} + m * {}  < {}:
             else:
                 tasklet = state.add_tasklet(
                     "write_C", {"from_kernel", "prev_c"}, {"to_memory"}, """\
-if tm * {} + m < {}:                 
-    to_memory = (from_kernel + prev_c)""".format(T, M))
+if tm * {} + m < {}  and  n0*{}+n1 < {}:                 
+    to_memory = (from_kernel + prev_c)""".format(T, M, P, N))
                 state.add_memlet_path(pipe,
                                       entry_map,
                                       tasklet,
@@ -897,7 +899,7 @@ if tm * {} + m < {}:
             entry_pipeline, exit_pipeline = state.add_pipeline(
                 "compute_and_drain",
                 {
-                    "n0": "0:{}/{}".format(N, P),
+                    "n0": "0:ceiling({}/{})".format(N, P),
                     "tm": "0:ceiling({}/{})".format(
                         M, T),  #if this is vectorized, M accounts for that
                     "k": "0:{}".format(K),
@@ -1317,7 +1319,7 @@ class FPGAGenericIm2ColConv(ONNXForward):
         # - #PEs (optimal number is the number of filters)
         # - Tile size T (optimal number is M)
         P = 8 # Num PEs  #TODO parametric
-        T = 16 # expressed in plain elements
+        T = 128 # expressed in plain elements
         assert (T % vec_width == 0)
 
 
