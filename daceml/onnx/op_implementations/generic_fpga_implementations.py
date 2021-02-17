@@ -99,9 +99,9 @@ class FPGARelu(ONNXForward):
         X = in_desc_with_name(node, state, sdfg, "X")
         Y = out_desc_with_name(node, state, sdfg, "Y")
 
-        # TODO: For the moment being, we support the same vect width
-        if X.veclen != Y.veclen:
-            return False
+        # # TODO: For the moment being, we support the same vect width
+        # if X.veclen != Y.veclen:
+        #     return False
         return True
 
     @staticmethod
@@ -129,12 +129,15 @@ class FPGARelu(ONNXForward):
         # We use internal symbols
         map_ranges = dict()
         x_shape = []
+        y_shape = []
         x_strides = []
-        axis_names = []
+        y_strides = []
+        x_axis_names = []
+        y_axis_names = []
 
         for i, n in enumerate(X.shape):
-            axis_name = "relu_axis{}".format(i)
-            axis_names.append(axis_name)
+            axis_name = "relu_x_axis{}".format(i)
+            x_axis_names.append(axis_name)
             map_ranges[f"__i{i}"] = f"0:{axis_name}"
             # add the symbol
             symbolic_axis = dace.symbol(axis_name)
@@ -146,8 +149,20 @@ class FPGARelu(ONNXForward):
             for j in range(i):
                 x_strides[j] = x_strides[j] * symbolic_axis
 
-        y_shape = x_shape
-        y_strides = x_strides
+        for i, n in enumerate(Y.shape):
+            axis_name = "relu_y_axis{}".format(i)
+            y_axis_names.append(axis_name)
+            map_ranges[f"__i{i}"] = f"0:{axis_name}"
+            # add the symbol
+            symbolic_axis = dace.symbol(axis_name)
+            new_sdfg.add_symbol(symbolic_axis.name, dace.int32)
+            # keep track of shapes and strides
+            # note that the stride looks like [relu_axis1*relu_axis2, relu_axis2, 1]
+            y_shape.append(symbolic_axis)
+            y_strides.append(1)
+            for j in range(i):
+                y_strides[j] = y_strides[j] * symbolic_axis
+
 
         new_state = new_sdfg.add_state("compute")
         # Create local versions of input data nodes, but using our new symbols, not the real ones
@@ -226,7 +241,7 @@ class FPGARelu(ONNXForward):
             #TODO: right now this handle the case Y.veclen==1
             assert (Y.veclen == 1)
             write_out_me, write_out_mx = new_state.add_map(
-                'relu_write_out_map', dict(i="0:{}".format(vec_width)))
+                'relu_write_out_map', dict(i="0:{}".format(vec_width)), unroll=True)
             tasklet = new_state.add_tasklet('read_tasklet', ['_in'], ['_out'],
                                             code="_out = _in")
             # write out
@@ -242,7 +257,7 @@ class FPGARelu(ONNXForward):
                 outer_mx,
                 y_write,
                 src_conn="_out",
-                memlet=dace.Memlet("Y[__i0, __i1*{}+i]".format(vec_width)))
+                memlet=dace.Memlet("Y[__i0, __i1, __i2, __i3*{}+i]".format(vec_width)))
 
         else:
             #write out
@@ -271,7 +286,10 @@ class FPGARelu(ONNXForward):
 
         # nest and map symbol
         for i, n in enumerate(X.shape):
-            symbol_mapping[axis_names[i]] = n
+            symbol_mapping[x_axis_names[i]] = n
+
+        for i, n in enumerate(Y.shape):
+            symbol_mapping[y_axis_names[i]] = n
 
         expansion = state.add_nested_sdfg(new_sdfg,
                                           sdfg,
@@ -281,7 +299,7 @@ class FPGARelu(ONNXForward):
                                           debuginfo=node.debuginfo,
                                           symbol_mapping=symbol_mapping)
 
-        expansion.sdfg.save('/tmp/expansion.sdfg')
+        expansion.sdfg.save('/tmp/relu_expansion.sdfg')
         return expansion
 
 
@@ -602,8 +620,8 @@ class FPGAGemm(ONNXForward):
         # TODO: these as libnode parameter
         # TODO: deal with dimensions that are not multiple of this
 
-        P = 8  # Number of Processing Elements
-        T = 16  # Tile size, not considering vectorization width (so plain floats)
+        P = 16  # Number of Processing Elements
+        T = 128   # Tile size, not considering vectorization width (so plain floats)
 
         assert (T % vec_width == 0)
 
@@ -1298,7 +1316,7 @@ class FPGAGenericIm2ColConv(ONNXForward):
         # Computational unit parameters:
         # - #PEs (optimal number is the number of filters)
         # - Tile size T (optimal number is M)
-        P = 6 # Num PEs  #TODO parametric
+        P = 8 # Num PEs  #TODO parametric
         T = 16 # expressed in plain elements
         assert (T % vec_width == 0)
 
