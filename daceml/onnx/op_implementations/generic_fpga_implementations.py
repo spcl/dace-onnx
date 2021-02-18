@@ -152,7 +152,6 @@ class FPGARelu(ONNXForward):
         for i, n in enumerate(Y.shape):
             axis_name = "relu_y_axis{}".format(i)
             y_axis_names.append(axis_name)
-            map_ranges[f"__i{i}"] = f"0:{axis_name}"
             # add the symbol
             symbolic_axis = dace.symbol(axis_name)
             new_sdfg.add_symbol(symbolic_axis.name, dace.int32)
@@ -162,7 +161,6 @@ class FPGARelu(ONNXForward):
             y_strides.append(1)
             for j in range(i):
                 y_strides[j] = y_strides[j] * symbolic_axis
-
 
         new_state = new_sdfg.add_state("compute")
         # Create local versions of input data nodes, but using our new symbols, not the real ones
@@ -1350,7 +1348,7 @@ class FPGAGenericIm2ColConv(ONNXForward):
                 schedule=dace.ScheduleType.FPGA_Device)
 
             # use a different map, and unroll it if necessary
-            unroll_inner_map = P >= (T//vec_width + L) and P <= 16
+            unroll_inner_map = P > (T//vec_width + L) and P <= 16
             send_map_entry, send_map_exit = state.add_map(
                 "send_weights", {"n1": "0:{}".format(P)},
                 schedule=dace.ScheduleType.FPGA_Device,
