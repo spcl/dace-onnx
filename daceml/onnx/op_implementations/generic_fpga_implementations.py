@@ -249,13 +249,15 @@ class FPGARelu(ONNXForward):
                                       dst_conn="_in",
                                       memlet=dace.Memlet("vec_data_in[i]"))
             # TODO: special case for GEMM->Relu, do the right memlet
+            memlet_access = "{}".format(",".join(['__i%d' % i for i in range(len(X.shape))]))
+
             new_state.add_memlet_path(
                 tasklet,
                 write_out_mx,
                 outer_mx,
                 y_write,
                 src_conn="_out",
-                memlet=dace.Memlet("Y[__i0, __i1, __i2, __i3*{}+i]".format(vec_width)))
+                memlet=dace.Memlet("Y[{}*{}+i]".format(memlet_access, vec_width)))
 
         else:
             #write out
