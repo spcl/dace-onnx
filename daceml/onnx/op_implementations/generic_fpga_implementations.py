@@ -1319,7 +1319,7 @@ class FPGAGenericIm2ColConv(ONNXForward):
         # - #PEs (optimal number is the number of filters)
         # - Tile size T (optimal number is M)
         P = 16 # Num PEs  #TODO parametric
-        T = 128 # expressed in plain elements
+        T = 72 # expressed in plain elements
         assert (T % vec_width == 0)
 
 
@@ -1350,7 +1350,12 @@ class FPGAGenericIm2ColConv(ONNXForward):
                 schedule=dace.ScheduleType.FPGA_Device)
 
             # use a different map, and unroll it if necessary
-            unroll_inner_map = P >= (T//vec_width + L) and P <= 16
+            #TODO: improve this, we can not always unroll
+            # - the condition  P >= (T//vec_width + L) seems to not be valid here for unknown reason (i.e.
+            #   it is useful to unroll even if P< (T//vec_width + L). I think it has to do with the
+            #   fact that we are reading from memory and not constant
+            # unroll_inner_map = P >= (T//vec_width + L) and P <= 16
+            unroll_inner_map = P <= 16
             send_map_entry, send_map_exit = state.add_map(
                 "send_weights", {"n1": "0:{}".format(P)},
                 schedule=dace.ScheduleType.FPGA_Device,
