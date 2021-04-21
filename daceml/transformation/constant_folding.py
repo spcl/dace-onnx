@@ -10,6 +10,7 @@ import torch
 from dace import data as dt, dtypes
 from dace import registry
 from dace.properties import make_properties
+from dace.transformation import pattern_matching
 from dace.transformation import transformation
 from dace.sdfg import nodes as nd
 from dace.sdfg import utils as sdutil
