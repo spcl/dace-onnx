@@ -1,4 +1,5 @@
 import collections
+import copy
 import logging
 import os
 import tempfile
@@ -61,8 +62,8 @@ class DaceModule(nn.Module):
         super(DaceModule, self).__init__()
 
         self.backward = backward
-        self.model = module
-        self.dace_model: Optional[ONNXModel] = None
+        self.pytorch_model = module
+        self.dace_onnx_model: Optional[ONNXModel] = None
         self.train = train
         self.sdfg: Optional[dace.SDFG] = None
         self.cuda = cuda
@@ -94,7 +95,7 @@ class DaceModule(nn.Module):
                     "auto_optimize"] = auto_optimize_backward
             else:
                 self.post_onnx_hooks["auto_optimize"] = \
-                    lambda dace_module: utils.auto_optimize(dace_module.dace_model.sdfg,
+                    lambda dace_module: utils.auto_optimize(dace_module.dace_onnx_model.sdfg,
                                                             self.cuda,
                                                             apply_strict=apply_strict)
         elif apply_strict:
@@ -158,39 +159,54 @@ class DaceModule(nn.Module):
 
     def _initialize_sdfg(self, dummy_inputs):
         # TODO change to StringIO if not too big
+
         with tempfile.TemporaryDirectory() as dir_name:
             export_name = os.path.join(dir_name, "export.onnx")
 
+            # save the state of the model, and restore it after tracing
+            state = copy.deepcopy(self.state_dict())
             torch.onnx.export(
-                self.model,
+                self.pytorch_model,
                 dummy_inputs,
                 export_name,
                 verbose=logging.root.level <= logging.DEBUG,
-                training=(TrainingMode.TRAINING
-                          if self.train else TrainingMode.EVAL),
+                # when training is set to EVAL, pytorch currently performs an optimization pass ("onnx_eval_peephole")
+                # that renames weights and thus breaks the model in some settings.
+                training=TrainingMode.TRAINING,
                 opset_version=12,
                 strip_doc_string=False,
                 export_params=not self.backward,
                 # pytorch constant folding will add new unnamed inputs to the graph and remove some of the
                 # named parameters of the model: this means that we can't match with the state dict
                 # anymore, so we disable this. Our CF is more flexible.
-                do_constant_folding=False)
+                do_constant_folding=False,
+                keep_initializers_as_inputs=True,
+            )
+            self.load_state_dict(state)
 
             onnx_model = infer_shapes(onnx.load(export_name))
-            self.onnx_model = onnx_model
 
             dace_model = ONNXModel(self.sdfg_name,
                                    onnx_model,
                                    infer_shapes=False,
                                    cuda=self.cuda,
-                                   parent_pytorch_module=self.model)
+                                   parent_pytorch_module=self.pytorch_model)
             self.sdfg = dace_model.sdfg
-            self.dace_model = dace_model
+            self.dace_onnx_model = dace_model
 
             self.sdfg.validate()
 
             for _, hook in self.post_onnx_hooks.items():
                 hook(self)
+
+            self.sdfg_inputs = {}
+            self.sdfg_inputs.update(self.pytorch_model.named_buffers())
+            self.sdfg_inputs.update(self.pytorch_model.named_parameters())
+            self.sdfg_inputs = {
+                k: v
+                for k, v in self.sdfg_inputs.items()
+                if k in self.dace_onnx_model.inputs
+            }
 
             if self.backward:
                 function = make_backward_function(dace_model)
@@ -199,14 +215,15 @@ class DaceModule(nn.Module):
                     hook(function._forward_model.sdfg, function._backward_sdfg)
 
                 def forward(*args):
-                    args_and_params = list(args)
-                    args_and_params.extend(self.parameters())
-                    return function.apply(*args_and_params)
+                    return function.apply(*args, **self.sdfg_inputs)
 
                 return forward
             else:
 
-                return dace_model
+                def forward(*args):
+                    return dace_model(*args, **self.sdfg_inputs)
+
+                return forward
 
     def forward(self, *actual_inputs):
         """ Execute the forward pass using the traced ``module``."""

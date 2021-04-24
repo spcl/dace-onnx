@@ -20,7 +20,7 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
     """
 
     pt_weight_name = parameter_path
-    pt_tensor = operator.attrgetter(pt_weight_name)(dace_module.model)
+    pt_tensor = operator.attrgetter(pt_weight_name)(dace_module.pytorch_model)
     array_name = clean_onnx_name(pt_weight_name)
 
     if array_name not in dace_module.sdfg.arrays:
@@ -60,8 +60,8 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
     # remove the CPU node
     state.remove_node(cand)
 
-    if "initialize_hook" not in dace_module.dace_model.post_compile_hooks:
-        dace_module.dace_model.post_compile_hooks[
+    if "initialize_hook" not in dace_module.dace_onnx_model.post_compile_hooks:
+        dace_module.dace_onnx_model.post_compile_hooks[
             "initialize_hook"] = lambda sdfg: sdfg.initialize()
 
     def post_compile_hook(compiled_sdfg):
@@ -78,5 +78,5 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
             ptr, compiled_sdfg.sdfg.arrays[gpu_array_name])
         torch_tensor[:] = pt_tensor
 
-    dace_module.dace_model.post_compile_hooks[
+    dace_module.dace_onnx_model.post_compile_hooks[
         "init_" + pt_weight_name] = post_compile_hook

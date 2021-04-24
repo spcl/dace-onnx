@@ -505,6 +505,10 @@ class ONNXModel:
         # add the weights
         params = {}
         for name, arr in self.weights.items():
+            # if a parameter is also an input, use the input
+            if name in self.inputs:
+                continue
+
             desc = self.sdfg.arrays[clean_onnx_name(name)]
             if type(desc) is dt.Scalar:
                 params[clean_onnx_name(name)] = arr.cpu().numpy()[()]

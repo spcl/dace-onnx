@@ -1,5 +1,8 @@
 import copy
+import functools
 import typing
+
+import numpy as np
 
 import dace
 from dace import SDFGState, SDFG, dtypes
@@ -7,13 +10,17 @@ from dace.sdfg import nodes, propagation
 
 from daceml.onnx.forward_implementation_abc import ONNXForward
 from daceml.onnx.nodes.onnx_op import ONNXOp
-from daceml.onnx.op_implementations.utils import op_implementation
-from daceml.util.utils import in_desc_with_name, out_desc_with_name
+from daceml.onnx.op_implementations.utils import op_implementation, program_for_node
+from daceml.util.utils import in_desc_with_name, out_desc_with_name, in_edge_with_name, out_edge_with_name
 
 
 def _2d_sliding_window_index_expr(x_or_y, stride, kernel_size):
     index_expression = "out_{x_or_y} * {stride} + h{x_or_y}"
     return index_expression.format(x_or_y=x_or_y, stride=stride)
+
+
+def _prod(sequence):
+    return functools.reduce(lambda a, b: a * b, sequence, 1)
 
 
 @op_implementation(op="MaxPool", name="pure")
@@ -356,5 +363,86 @@ class PureConv2D(ONNXForward):
                                     internal_connector="output")
 
         new_sdfg.fill_scope_connectors()
+
+        return new_sdfg
+
+
+@op_implementation(op="BatchNormalization", name="pure")
+class PureBatchNormalization(ONNXForward):
+    @staticmethod
+    def forward_can_be_applied(node: ONNXOp, state: SDFGState,
+                               sdfg: SDFG) -> bool:
+        X = in_desc_with_name(node, state, sdfg, "X")
+        if len(X.shape) != 4:
+            return False
+
+        # only for training for now
+        if not {"out_mean", "out_var", "saved_mean", "saved_var"}.issubset(
+                node.out_connectors):
+            return False
+        if not {"scale", "B"}.issubset(node.in_connectors):
+            return False
+
+        return True
+
+    @staticmethod
+    def forward(node: ONNXOp, state: SDFGState,
+                sdfg: SDFG) -> typing.Union[nodes.Node, SDFG]:
+
+        reduce_axes = list(
+            copy.deepcopy(in_desc_with_name(node, state, sdfg, "X").shape))
+        num_channels = reduce_axes.pop(1)
+
+        N = _prod(reduce_axes)
+        broadcast_shape = [num_channels, 1, 1]
+        dtype = in_desc_with_name(node, state, sdfg, "X").dtype
+        eps = node.epsilon
+        momentum = node.momentum
+        inv_momentum = 1 - node.momentum
+
+        def prog(X, scale, B, in_mean, in_var, Y, out_mean, out_var,
+                 saved_mean, saved_var):
+            saved_mean[:] = np.add.reduce(X, axis=[0, 2, 3]) / N
+
+            saved_mean_broadcastable = dace.define_local(
+                broadcast_shape, dtype)
+            # this copy will get removed after parsing -- using reshape here would be nicer
+            # but it messes with statefusion
+            saved_mean_broadcastable[:] = saved_mean
+
+            X_minus_mean = (X - saved_mean_broadcastable)
+
+            saved_var[:] = np.add.reduce(X_minus_mean * X_minus_mean,
+                                         axis=(0, 2, 3)) / N
+            saved_var_eps = np.reshape(saved_var + eps, broadcast_shape)
+
+            normalized = X_minus_mean * (dace.float32(1.0) /
+                                         np.sqrt(saved_var_eps))
+
+            scale_reshaped = np.reshape(scale, broadcast_shape)
+            bias_reshaped = np.reshape(B, broadcast_shape)
+            Y[:] = normalized * scale_reshaped + bias_reshaped
+
+            out_mean[:] = in_mean * momentum + saved_mean * inv_momentum
+            out_var[:] = in_var * momentum + saved_var * inv_momentum
+
+        new_sdfg = program_for_node(prog, sdfg, state, node)
+
+        # write the mean and var back to the parameters so that they are updated
+        # this is a bit of a hack, but the ONNX spec is currently not really working for training
+        new_state = sdfg.add_state_after(sdfg.nodes()[0])
+        mean_data_name = out_edge_with_name(node, state, "out_mean").data.data
+        read_mean = new_state.add_read(mean_data_name)
+        write_mean = new_state.add_read(
+            in_edge_with_name(node, state, "in_mean").data.data)
+        new_state.add_edge(read_mean, None, write_mean, None,
+                           sdfg.make_array_memlet(mean_data_name))
+
+        var_data_name = out_edge_with_name(node, state, "out_var").data.data
+        read_var = new_state.add_read(var_data_name)
+        write_var = new_state.add_read(
+            in_edge_with_name(node, state, "in_var").data.data)
+        new_state.add_edge(read_var, None, write_var, None,
+                           sdfg.make_array_memlet(var_data_name))
 
         return new_sdfg

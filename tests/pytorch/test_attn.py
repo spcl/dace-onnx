@@ -27,7 +27,7 @@ def test_attn(gpu, sdfg_name):
     dace_model = DaceModule(ptmodel, cuda=gpu, sdfg_name=sdfg_name)
     dace_outputs_0 = dace_model(Q, K, V)
 
-    dace_model.dace_model.sdfg.apply_transformations_repeated(
+    dace_model.dace_onnx_model.sdfg.apply_transformations_repeated(
         [ConstantFolding, RedundantSecondArray],
         validate_all=True,
         strict=True)
