@@ -183,8 +183,6 @@ class CudnnConvolution(ONNXForward):
 
         T = X_desc.dtype
 
-        in_connectors = {"_X": dace.pointer(T), "_W": dace.pointer(T)}
-
         unique_id = "{}_{}_{}_{}".format(clean_onnx_name(node.name),
                                          sdfg.sdfg_id, sdfg.node_id(state),
                                          state.node_id(node))
@@ -303,13 +301,146 @@ class CudnnConvolution(ONNXForward):
         ));
         """
 
-        tasklet = nstate.add_tasklet(unique_id, in_connectors,
-                                     {"_Y": dace.pointer(T)}, tasklet_code,
-                                     dtypes.Language.CPP)
+        tasklet = nstate.add_tasklet(unique_id, {
+            "_X": dace.pointer(T),
+            "_W": dace.pointer(T)
+        }, {"_Y": dace.pointer(T)}, tasklet_code, dtypes.Language.CPP)
         nstate.add_edge(inputs["X"], None, tasklet, "_X",
                         nsdfg.make_array_memlet("X"))
         nstate.add_edge(inputs["W"], None, tasklet, "_W",
                         nsdfg.make_array_memlet("W"))
+
+        nstate.add_edge(tasklet, "_Y", outputs["Y"], None,
+                        nsdfg.make_array_memlet("Y"))
+
+        return nsdfg
+
+
+@op_implementation(op="BatchNormalization", name="cuDNN")
+class CudnnBatchNormalizationTraining(ONNXForward):
+    environments = []
+
+    @staticmethod
+    def forward_can_be_applied(node: onnx_op.ONNXOp, state: SDFGState,
+                               sdfg: SDFG) -> bool:
+        X = in_desc_with_name(node, state, sdfg, "X")
+        if len(X.shape) != 4:
+            return False
+
+        # only for training for now
+        if not {"out_mean", "out_var", "saved_mean", "saved_var"}.issubset(
+                node.out_connectors):
+            return False
+        if not {"scale", "B"}.issubset(node.in_connectors):
+            return False
+
+        return True
+
+    @staticmethod
+    def forward(node: onnx_op.ONNXOp, state: SDFGState,
+                sdfg: SDFG) -> Union[nd.Node, SDFG]:
+
+        nsdfg, nstate, inputs, outputs = empty_sdfg_for_node(sdfg, state, node)
+
+        X_desc = in_desc_with_name(node, state, sdfg, "X")
+        T = X_desc.dtype
+
+        unique_id = "{}_{}_{}_{}".format(clean_onnx_name(node.name),
+                                         sdfg.sdfg_id, sdfg.node_id(state),
+                                         state.node_id(node))
+
+        class Environment:
+            cmake_minimum_version = None
+            cmake_packages = []
+            cmake_variables = {}
+            cmake_includes = []
+            cmake_libraries = []
+            cmake_compile_flags = []
+            cmake_link_flags = []
+            cmake_files = []
+            state_fields = [
+                f"cudnnConvolutionDescriptor_t *{unique_id}_conv_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_scale_desc;",
+            ]
+            dependencies = [environments.cuDNN]
+            headers = []
+            init_code = ""
+            finalize_code = ""
+
+        Environment.__name__ = unique_id + "_environment"
+        dace.library.environment(Environment)
+        CudnnBatchNormalizationTraining.environments = [Environment]
+
+        init, exit = _cudnn_tensor_descriptor_code(inputs["X"].desc(nsdfg),
+                                                   f"{unique_id}_X_desc",
+                                                   False)
+        Environment.init_code += init
+        Environment.finalize_code += exit
+
+        init, exit = _cudnn_tensor_descriptor_code(outputs["Y"].desc(nsdfg),
+                                                   f"{unique_id}_Y_desc",
+                                                   False)
+        Environment.init_code += init
+        Environment.finalize_code += exit
+
+        # setup scale descriptor
+        Environment.init_code += f"""
+        __state->{unique_id}_scale_desc = new cudnnTensorDescriptor_t; 
+        daceml::cudnn::CheckCudnnError(cudnnCreateTensorDescriptor(__state->{unique_id}_scale_desc));
+        daceml::cudnn::CheckCudnnError(cudnnDeriveBNTensorDescriptor(
+            *__state->{unique_id}_scale_desc,
+            *__state->{unique_id}_X_desc,
+            CUDNN_BATCHNORM_SPATIAL));
+        """
+        Environment.finalize_code += f"""
+        daceml::cudnn::CheckCudnnError(cudnnDestroyTensorDescriptor(*__state->{unique_id}_scale_desc));
+        delete __state->{unique_id}_scale_desc;
+        """
+
+        tasklet_code = f"""
+        {environments.cuDNN.handle_setup_code(node)}
+        float alpha = 1.f;
+        float beta = 0.f;
+        daceml::cudnn::CheckCudnnError(cudnnBatchNormalizationForwardTraining(
+            __dace_cudnn_handle,
+            CUDNN_BATCHNORM_SPATIAL,
+            &alpha,
+            &beta,
+            *__state->{unique_id}_X_desc,
+            _X,
+            *__state->{unique_id}_Y_desc,
+            _Y,
+            *__state->{unique_id}_scale_desc,
+            _scale,
+            _B,
+            {1 - node.momentum},
+            _in_mean,
+            _in_var,
+            {node.epsilon},
+            nullptr,
+            nullptr));
+        """
+
+        in_connectors = ["X", "B", "scale", "in_mean", "in_var"]
+        tasklet = nstate.add_tasklet(
+            unique_id, {f"_{i}": dace.pointer(T)
+                        for i in in_connectors}, {"_Y": dace.pointer(T)},
+            tasklet_code, dtypes.Language.CPP)
+        for inp in in_connectors:
+            nstate.add_edge(inputs[inp], None, tasklet, f"_{inp}",
+                            nsdfg.make_array_memlet(inp))
+
+        for inp, anode in inputs.items():
+            if f"_{inp}" not in tasklet.in_connectors:
+                nstate.remove_node(anode)
+                del node.in_connectors[inp]
+
+        for outp, anode in outputs.items():
+            if f"_{outp}" not in tasklet.out_connectors:
+                nstate.remove_node(anode)
+                del node.out_connectors[outp]
 
         nstate.add_edge(tasklet, "_Y", outputs["Y"], None,
                         nsdfg.make_array_memlet("Y"))
