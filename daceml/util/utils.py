@@ -12,6 +12,8 @@ from dace import SDFG, SDFGState
 import dace.data as dt
 from dace.transformation.auto_optimize import set_fast_implementations
 
+import daceml
+from daceml.onnx.converters import clean_onnx_name
 from daceml.onnx.nodes.onnx_op import ONNXOp
 from daceml import transformation
 
@@ -158,6 +160,17 @@ def auto_optimize(sdfg: dace.SDFG,
         sdfg,
         dace.DeviceType.GPU if cuda else dace.DeviceType.CPU,
         blocklist=["MKL"])
+
+    if cuda:
+        # Set library nodes
+        for node, state in sdfg.all_nodes_recursive():
+            if isinstance(node, dace.nodes.LibraryNode):
+                from dace.sdfg.scope import is_devicelevel_gpu
+                # Use CUB for device-level reductions
+                if ('CUDA (device)' in node.implementations):
+                    if (not is_devicelevel_gpu(state.parent, state, node)
+                            and state.scope_dict()[node] is None):
+                        node.implementation = 'CUDA (device)'
     if apply_strict:
         log.debug("Applying strict transforms")
         # there is a nondeterministic bug in redundant array that appears if
@@ -175,3 +188,11 @@ def iterables_equal(a, b) -> bool:
 
 def prod(sequence):
     return functools.reduce(lambda a, b: a * b, sequence, 1)
+
+
+def find_unclean_onnx_name(model: 'daceml.onnx.onnx_importer.ONNXModel',
+                           name: str) -> str:
+    unclean_name = [n for n in model.weights if clean_onnx_name(n) == name]
+    if len(unclean_name) != 1:
+        raise ValueError(f"Could not find unclean name for name {name}")
+    return unclean_name[0]
