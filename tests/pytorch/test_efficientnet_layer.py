@@ -21,11 +21,13 @@ def test_cudnn_conv():
     donnx.ONNXConv.default_implementation = "cuDNN"
     inputs = torch.rand(1, 32, 224, 224)
 
-    pt_model = nn.Conv2d(32, 8, kernel_size=(3, 3), bias=False)
+    pt_model = nn.Conv2d(32, 8, kernel_size=(3, 3))
 
     dace_model = DaceModule(pt_model, cuda=True)
     dace_model.append_post_onnx_hook("view", lambda m: m.sdfg.view())
-    dace_model(inputs)
+    out = dace_model(inputs)
+    pt_out = pt_model(inputs)
+    torch_tensors_close("output", pt_out, out)
 
 
 def bn_numpy(X, scale, B, in_mean, in_var, Y, out_mean, out_var, saved_mean,
