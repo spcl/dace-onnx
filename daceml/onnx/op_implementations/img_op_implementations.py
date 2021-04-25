@@ -239,132 +239,59 @@ class PureConv2D(ONNXForward):
 
         output_size_y, output_size_x = Y.shape[2:]
 
-        new_sdfg = dace.SDFG("pure_conv")
+        dtype = X.dtype
 
-        init_state = new_sdfg.add_state("init")
-        new_state = new_sdfg.add_state_after(init_state, "compute")
-        new_sdfg.add_datadesc("X", copy.deepcopy(X))
-        new_sdfg.add_datadesc("W", copy.deepcopy(W))
-        new_sdfg.add_datadesc("Y", copy.deepcopy(Y))
-        if B is not None:
-            new_sdfg.add_datadesc("B", copy.deepcopy(B))
-            new_sdfg.arrays["B"].transient = False
+        @dace.program
+        def broadcast(x: dtype[batch_size, num_filters, output_size_y,
+                               output_size_x], y: dtype[num_filters]):
+            for b, m, out_x, out_y in dace.map[0:batch_size, 0:num_filters,
+                                               0:output_size_y,
+                                               0:output_size_x]:
+                with dace.tasklet:
+                    inp << y[m]
+                    outp >> x[b, m, out_x, out_y]
+                    outp = inp
 
-        new_sdfg.arrays["X"].transient = False
-        new_sdfg.arrays["W"].transient = False
-        new_sdfg.arrays["Y"].transient = False
+        @dace.program
+        def zero_init(x: dtype[batch_size, num_filters, output_size_y,
+                               output_size_x]):
+            for b, m, out_x, out_y in dace.map[0:batch_size, 0:num_filters,
+                                               0:output_size_y,
+                                               0:output_size_x]:
+                with dace.tasklet:
+                    outp >> x[b, m, out_x, out_y]
+                    outp = 0
 
-        # add init state
-        # yapf: disable
-        init_state.add_mapped_tasklet("init",
-                                      map_ranges={
-                                          "i{}".format(i): "0:{}".format(s)
-                                          for i, s in enumerate(Y.shape)
-                                      },
-                                      inputs={},
-                                      code="y = 0",
-                                      outputs=dict(
-                                          y=dace.Memlet("Y[{}]".format(
-                                              ", ".join("i{}".format(i)
-                                                        for i, _ in enumerate(Y.shape))))
-                                      ),
-                                      external_edges=True)
-        # yapf: enable
+        if B is None:
 
-        # the outer map loops over every entry in the output array
-        outer_me, outer_mx = new_state.add_map(
-            'outer_conv_map',
-            dict(b="0:{}".format(batch_size),
-                 m="0:{}".format(num_filters),
-                 out_x="0:{}".format(output_size_x),
-                 out_y="0:{}".format(output_size_y)))
+            def conv(X, Y, W):
+                zero_init(Y)
+                for b, m, out_x, out_y in dace.map[0:batch_size, 0:num_filters,
+                                                   0:output_size_y,
+                                                   0:output_size_x]:
+                    for cin, hx, hy in dace.map[0:num_channels, 0:filter_hx,
+                                                0:filter_hy]:
+                        with dace.tasklet:
+                            filter << W[m, cin, hx, hy]
+                            image << X[b, cin, hx + out_x, hy + out_y]
+                            out >> Y(1, lambda x, y: x + y)[b, m, out_x, out_y]
+                            out = filter * image
+        else:
 
-        # the inner map computes the value for a single entry in the output array (i.e. Y[b, m, x, y])
-        inner_me, inner_mx = new_state.add_map(
-            'inner_conv_map',
-            dict(cin="0:{}".format(num_channels),
-                 hx="0:{}".format(filter_hx),
-                 hy="0:{}".format(filter_hy)))
+            def conv(X, Y, W, B):
+                broadcast(Y, B)
+                for b, m, out_x, out_y in dace.map[0:batch_size, 0:num_filters,
+                                                   0:output_size_y,
+                                                   0:output_size_x]:
+                    for cin, hx, hy in dace.map[0:num_channels, 0:filter_hx,
+                                                0:filter_hy]:
+                        with dace.tasklet:
+                            filter << W[m, cin, hx, hy]
+                            image << X[b, cin, hx + out_x, hy + out_y]
+                            out >> Y(1, lambda x, y: x + y)[b, m, out_x, out_y]
+                            out = filter * image
 
-        compute_tasklet = new_state.add_tasklet(
-            "compute_entry",
-            inputs={"image_in", "filter_in"},
-            outputs={"output"},
-            code="output = image_in * filter_in")
-
-        filter_memlet = dace.Memlet("W[m, cin, hx, hy]")
-
-        x_idx = _2d_sliding_window_index_expr(x_or_y="x",
-                                              stride=stride_x,
-                                              kernel_size=filter_hx)
-        y_idx = _2d_sliding_window_index_expr(x_or_y="y",
-                                              stride=stride_y,
-                                              kernel_size=filter_hy)
-
-        image_memlet = dace.Memlet("X[b, cin, {}, {}]".format(x_idx, y_idx))
-
-        # hook up the inner map to the tasklet
-        new_state.add_edge(inner_me, None, compute_tasklet, "filter_in",
-                           filter_memlet)
-        new_state.add_edge(inner_me, None, compute_tasklet, "image_in",
-                           image_memlet)
-
-        # hook up filter
-        read_W = new_state.add_read("W")
-        inner_filter_memlet = propagation.propagate_memlet(
-            new_state, filter_memlet, inner_me, False)
-        outer_filter_memlet = propagation.propagate_memlet(
-            new_state, inner_filter_memlet, outer_me, False)
-        new_state.add_edge(outer_me, None, inner_me, None, inner_filter_memlet)
-        new_state.add_edge(read_W, None, outer_me, None, outer_filter_memlet)
-
-        # hook up X
-        read_X = new_state.add_read("X")
-        inner_image_memlet = propagation.propagate_memlet(
-            new_state, image_memlet, inner_me, False)
-        outer_image_memlet = propagation.propagate_memlet(
-            new_state, inner_image_memlet, outer_me, False)
-        new_state.add_edge(outer_me, None, inner_me, None, inner_image_memlet)
-        new_state.add_edge(read_X, None, outer_me, None, outer_image_memlet)
-
-        # hook up outputs
-        output_memlet = dace.Memlet("Y[b, m, out_x, out_y]",
-                                    wcr="lambda x, y: x + y")
-        inner_output_memlet = propagation.propagate_memlet(
-            new_state, output_memlet, inner_me, False)
-        outer_output_memlet = propagation.propagate_memlet(
-            new_state, inner_output_memlet, outer_me, False)
-        new_state.add_edge(compute_tasklet, "output", inner_mx, None,
-                           output_memlet)
-
-        write_Y = new_state.add_write("Y")
-        new_state.add_edge_pair(outer_mx, inner_mx, write_Y,
-                                inner_output_memlet, outer_output_memlet)
-
-        # hook up B if required
-        if B is not None:
-            read_B = new_state.add_read("B")
-            B_memlet = dace.Memlet("B[m]")
-            new_state.add_edge(
-                read_B, None, outer_me, None,
-                propagation.propagate_memlet(new_state, B_memlet, outer_me,
-                                             False))
-
-            add_bias_tasklet = new_state.add_tasklet("add_bias", {"bias_in"},
-                                                     {"output"},
-                                                     "output = bias_in")
-            new_state.add_edge(outer_me, None, add_bias_tasklet, "bias_in",
-                               B_memlet)
-            new_state.add_edge_pair(outer_mx,
-                                    add_bias_tasklet,
-                                    write_Y,
-                                    output_memlet,
-                                    outer_output_memlet,
-                                    internal_connector="output")
-
-        new_sdfg.fill_scope_connectors()
-
-        return new_sdfg
+        return program_for_node(conv, sdfg, state, node)
 
 
 @op_implementation(op="BatchNormalization", name="pure")
