@@ -11,17 +11,19 @@ from dace.transformation.dataflow import RedundantSecondArray
 from torch import nn
 from torch.nn import functional as F
 
+import daceml.onnx as donnx
 from daceml.pytorch import DaceModule
 from daceml.testing.utils import torch_tensors_close
 from daceml.transformation import ConstantFolding, ConstantDeviceCopyElimination
 
 
-def testconv2dynpad():
+def test_cudnn_conv():
+    donnx.ONNXConv.default_implementation = "cuDNN"
     inputs = torch.rand(1, 32, 224, 224)
 
-    pt_model = nn.BatchNorm2d(num_features=32)
+    pt_model = nn.Conv2d(32, 8, kernel_size=(3, 3), bias=False)
 
-    dace_model = DaceModule(pt_model)
+    dace_model = DaceModule(pt_model, cuda=True)
     dace_model.append_post_onnx_hook("view", lambda m: m.sdfg.view())
     dace_model(inputs)
 
