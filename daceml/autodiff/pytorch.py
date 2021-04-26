@@ -1,10 +1,11 @@
 import logging
 from collections import OrderedDict
-from typing import Type
+from typing import Type, Tuple, Dict, Callable
 
 import dace
 import torch
 from dace import data as dt
+from dace.codegen import compiled_sdfg
 
 from daceml.autodiff.backward_pass_generator import BackwardPassGenerator
 from daceml.autodiff.base_abc import AutoDiffException
@@ -14,10 +15,13 @@ from daceml.pytorch.module import DaceModule
 
 log = logging.getLogger(__name__)
 
+hook_type = Dict[str, Callable[
+    [compiled_sdfg.CompiledSDFG, compiled_sdfg.CompiledSDFG], None]]
+
 
 def make_backward_function(
         model: DaceModule,
-        apply_strict=False) -> Type[torch.autograd.Function]:
+        apply_strict=False) -> Tuple[hook_type, Type[torch.autograd.Function]]:
     """ Convert an ONNXModel to a PyTorch differentiable function. This method should not be used on it's own.
         Instead use the ``backward=True`` parameter of :class:`daceml.pytorch.DaceModule`.
 
@@ -112,6 +116,7 @@ def make_backward_function(
         else:
             forward_sdfg.arrays[name].transient = False
 
+    backward_sdfg.view()
     backward_sdfg.validate()
 
     # initialization of the SDFGs
@@ -248,4 +253,4 @@ def make_backward_function(
 
             return tuple(input_grad_values.values())
 
-    return DaceFunction
+    return gen.post_compile_hooks, DaceFunction

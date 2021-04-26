@@ -130,6 +130,57 @@ def test_bn_training(sdfg_name):
         pt_output.backward(dy)
         dace_output.backward(dy)
 
+        for (pt_name, pt_buf), (dace_name,
+                                dace_buf) in zip(pt_model.named_buffers(),
+                                                 dace_model.named_buffers()):
+            assert pt_name in dace_name
+            if "num_batches_tracked" not in pt_name:
+                torch_tensors_close(pt_name, pt_buf, dace_buf)
+
+        for (name,
+             dace_param), (pt_name,
+                           pt_param) in zip(pt_model.named_parameters(),
+                                            dace_model.named_parameters()):
+            assert 'pytorch_model.' + name == pt_name
+            torch_tensors_close(name, pt_param.detach(), dace_param.detach())
+
+
+@pytest.mark.pure
+@pytest.mark.gpu
+def test_mbconv_training(sdfg_name):
+    with change_default(donnx.ONNXBatchNormalization, "cuDNN"), \
+         change_default(donnx.ONNXConv, "cuDNN"):
+        torch.random.manual_seed(42)
+        inputs = torch.rand(1, 64, 60, 60, requires_grad=True).cuda()
+        dy = torch.rand(1, 64, 60, 60).cuda()
+
+        block_params, global_params = get_model_params("efficientnet-b0", {})
+
+        pt_model = MBConvBlock(block_params[0], global_params).cuda()
+        pt_model.set_swish(memory_efficient=False)
+        dace_model = MBConvBlock(block_params[0], global_params).cuda()
+        dace_model.set_swish(memory_efficient=False)
+
+        dace_model.load_state_dict(pt_model.state_dict())
+
+        dace_model = DaceModule(dace_model, cuda=True, backward=True)
+        dace_model.prepend_post_onnx_hook(
+            "cf",
+            lambda onnx_model: onnx_model.sdfg.apply_transformations_repeated(
+                {
+                    ConstantFolding, RedundantSecondArray,
+                    ConstantDeviceCopyElimination
+                },
+                validate_all=True,
+                strict=True))
+
+        pt_output = pt_model(inputs)
+        dace_output = dace_model(inputs)
+
+        torch_tensors_close("output", pt_output, dace_output)
+        pt_output.backward(dy)
+        dace_output.backward(dy)
+
         for (name,
              dace_param), (pt_name,
                            pt_param) in zip(pt_model.named_parameters(),

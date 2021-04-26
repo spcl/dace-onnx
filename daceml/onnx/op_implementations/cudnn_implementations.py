@@ -201,7 +201,7 @@ class CudnnConvolution(ONNXForward):
                 f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
                 f"cudnnFilterDescriptor_t *{unique_id}_W_desc;",
-                f"float *{unique_id}_workspace;"
+                f"float *{unique_id}_workspace;",
                 f"size_t *{unique_id}_workspace_size;"
             ]
             dependencies = [environments.cuDNN]
@@ -362,6 +362,10 @@ class CudnnBatchNormalizationTraining(ONNXForward):
                 f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_scale_desc;",
+                f"float *{unique_id}_workspace;",
+                f"size_t *{unique_id}_workspace_size;"
+                f"float *{unique_id}_reserved;",
+                f"size_t *{unique_id}_reserved_size;"
             ]
             dependencies = [environments.cuDNN]
             headers = []
@@ -398,17 +402,59 @@ class CudnnBatchNormalizationTraining(ONNXForward):
         delete __state->{unique_id}_scale_desc;
         """
 
+        # setup workspace and reserve space
+        Environment.init_code += \
+            f"""
+        {environments.cuDNN.handle_setup_code(node, init_stream=False)}
+        // Setup workspace and reserved space for {unique_id}
+        size_t ws_size;
+        daceml::cudnn::CheckCudnnError(cudnnGetBatchNormalizationForwardTrainingExWorkspaceSize(
+            __dace_cudnn_handle,
+            CUDNN_BATCHNORM_SPATIAL,
+            CUDNN_BATCHNORM_OPS_BN,
+            *__state->{unique_id}_X_desc,
+            nullptr,
+            *__state->{unique_id}_Y_desc,
+            *__state->{unique_id}_scale_desc,
+            nullptr,
+            &ws_size));
+        __state->{unique_id}_workspace_size = new size_t;
+        *__state->{unique_id}_workspace_size = ws_size;
+        cudaMalloc(&__state->{unique_id}_workspace, ws_size);
+
+        size_t rs_size;
+        daceml::cudnn::CheckCudnnError(cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
+            __dace_cudnn_handle,
+            CUDNN_BATCHNORM_SPATIAL,
+            CUDNN_BATCHNORM_OPS_BN,
+            nullptr,
+            *__state->{unique_id}_X_desc,
+            &rs_size));
+        __state->{unique_id}_reserved_size = new size_t;
+        *__state->{unique_id}_reserved_size = rs_size;
+        cudaMalloc(&__state->{unique_id}_reserved, rs_size);
+        """
+        Environment.finalize_code += f"""
+        cudaFree(__state->{unique_id}_workspace);
+        cudaFree(__state->{unique_id}_reserved);
+        delete __state->{unique_id}_reserved_size;
+        delete __state->{unique_id}_workspace_size;
+        """
+
         tasklet_code = f"""
         {environments.cuDNN.handle_setup_code(node)}
         float alpha = 1.f;
         float beta = 0.f;
-        daceml::cudnn::CheckCudnnError(cudnnBatchNormalizationForwardTraining(
+        daceml::cudnn::CheckCudnnError(cudnnBatchNormalizationForwardTrainingEx(
             __dace_cudnn_handle,
             CUDNN_BATCHNORM_SPATIAL,
+            CUDNN_BATCHNORM_OPS_BN,
             &alpha,
             &beta,
             *__state->{unique_id}_X_desc,
             _X,
+            *__state->{unique_id}_X_desc,
+            nullptr,
             *__state->{unique_id}_Y_desc,
             _Y,
             *__state->{unique_id}_scale_desc,
@@ -418,15 +464,23 @@ class CudnnBatchNormalizationTraining(ONNXForward):
             _in_mean,
             _in_var,
             {node.epsilon},
+            _saved_mean,
+            _saved_var,
             nullptr,
-            nullptr));
+            __state->{unique_id}_workspace,
+            *__state->{unique_id}_workspace_size,
+            __state->{unique_id}_reserved,
+            *__state->{unique_id}_reserved_size));
         """
 
         in_connectors = ["X", "B", "scale", "in_mean", "in_var"]
+        out_connectors = ["Y", "saved_mean", "saved_var"]
         tasklet = nstate.add_tasklet(
             unique_id, {f"_{i}": dace.pointer(T)
-                        for i in in_connectors}, {"_Y": dace.pointer(T)},
-            tasklet_code, dtypes.Language.CPP)
+                        for i in in_connectors},
+            {f"_{i}": dace.pointer(T)
+             for i in out_connectors}, tasklet_code, dtypes.Language.CPP)
+
         for inp in in_connectors:
             nstate.add_edge(inputs[inp], None, tasklet, f"_{inp}",
                             nsdfg.make_array_memlet(inp))
@@ -436,17 +490,16 @@ class CudnnBatchNormalizationTraining(ONNXForward):
                 nstate.remove_node(anode)
                 del node.in_connectors[inp]
 
+        for outp in out_connectors:
+            nstate.add_edge(tasklet, f"_{outp}", outputs[outp], None,
+                            nsdfg.make_array_memlet(outp))
+
         for outp, anode in outputs.items():
             if f"_{outp}" not in tasklet.out_connectors:
                 nstate.remove_node(anode)
                 del node.out_connectors[outp]
 
-        nstate.add_edge(tasklet, "_Y", outputs["Y"], None,
-                        nsdfg.make_array_memlet("Y"))
-
         remove_output_connector(sdfg, state, node, "out_mean")
         remove_output_connector(sdfg, state, node, "out_var")
-        remove_output_connector(sdfg, state, node, "saved_mean")
-        remove_output_connector(sdfg, state, node, "saved_var")
 
         return nsdfg

@@ -6,7 +6,7 @@ import collections
 import copy
 import logging
 import numbers
-from typing import List, Tuple, Set, Dict, Union, Deque, cast, Optional
+from typing import List, Tuple, Set, Dict, Union, Deque, cast, Optional, Callable
 
 import dace
 import dace.sdfg.nodes as nd
@@ -14,6 +14,7 @@ import dace.transformation.transformation as xf
 import sympy as sp
 from dace import Memlet, SDFG, SDFGState
 from dace import dtypes, data as dt
+from dace.codegen import compiled_sdfg
 from dace.frontend.operations import detect_reduction_type
 from dace.sdfg import graph as dgraph, state as dstate, utils as dutils, infer_types
 
@@ -328,6 +329,11 @@ class BackwardPassGenerator:
         # checks if backward has already been applied
         self._applied = False
         self.apply_strict = apply_strict
+
+        #: hooks that must be executed after the sdfg is compiled
+        self.post_compile_hooks: Dict[str, Callable[
+            [compiled_sdfg.CompiledSDFG, compiled_sdfg.CompiledSDFG],
+            None]] = {}
 
         for outp in self.given_gradients:
             if outp not in self.forward_state:
@@ -1124,6 +1130,8 @@ class BackwardPassGenerator:
                                     backward_sdfg=reverse_sdfg,
                                     backward_state=backward_state)
         backward_result, _, backward_input_arrays = gen.backward()
+        # copy over the hooks
+        self.post_compile_hooks.update(gen.post_compile_hooks)
 
         # we need to defer add edges until after the arrays have been added because creation of the nested
         # sdfg fails otherwise

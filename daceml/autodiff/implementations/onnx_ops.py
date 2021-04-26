@@ -1,4 +1,5 @@
 import copy
+import ctypes
 import itertools
 import typing
 from typing import List, Optional, Tuple, Dict, Union
@@ -314,6 +315,14 @@ class CuDNNBatchNormBackward(BackwardImplementation):
         new_scale_desc.transient = False
         nsdfg.add_datadesc("scale", new_scale_desc)
 
+        # saved vars
+        for saved in ["saved_mean", "saved_var"]:
+            saved_desc = copy.deepcopy(
+                butils.forward_out_desc_with_name(forward_node, context,
+                                                  saved))
+            saved_desc.transient = False
+            nsdfg.add_datadesc(saved, saved_desc)
+
         # setup state
         nstate = nsdfg.add_state()
         fwd_unique_id = "{}_{}_{}_{}".format(
@@ -337,6 +346,10 @@ class CuDNNBatchNormBackward(BackwardImplementation):
                 f"cudnnTensorDescriptor_t *{unique_id}_dX_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_dY_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_dScale_desc;",
+                f"float *{unique_id}_workspace;",
+                f"size_t *{unique_id}_workspace_size;",
+                f"float *{unique_id}_reserved;",
+                f"size_t *{unique_id}_reserved_size;"
             ]
             dependencies = [environments.cuDNN]
             headers = []
@@ -377,48 +390,89 @@ class CuDNNBatchNormBackward(BackwardImplementation):
         delete __state->{unique_id}_dScale_desc;
         """
 
+        # setup workspace
+        Environment.init_code += \
+            f"""
+        {environments.cuDNN.handle_setup_code(forward_node, init_stream=False)}
+        // Setup workspace and reserved space for {unique_id}
+        size_t ws_size;
+        daceml::cudnn::CheckCudnnError(cudnnGetBatchNormalizationBackwardExWorkspaceSize(
+            __dace_cudnn_handle,
+            CUDNN_BATCHNORM_SPATIAL,
+            CUDNN_BATCHNORM_OPS_BN,
+            *__state->{unique_id}_X_desc,
+            nullptr,
+            *__state->{unique_id}_dY_desc,
+            nullptr,
+            *__state->{unique_id}_dX_desc,
+            *__state->{unique_id}_dScale_desc,
+            nullptr,
+            &ws_size));
+        __state->{unique_id}_workspace_size = new size_t;
+        *__state->{unique_id}_workspace_size = ws_size;
+        cudaMalloc(&__state->{unique_id}_workspace, ws_size);
+        """
+        Environment.finalize_code += f"""
+        delete __state->{unique_id}_workspace_size;
+        cudaFree(__state->{unique_id}_workspace);
+        """
+
+        def post_compile_hook(fwd, bwd):
+            bwd_s = bwd.get_state_struct()
+            fwd_s = fwd.get_state_struct()
+            setattr(
+                bwd_s, f"{unique_id}_reserved",
+                ctypes.c_void_p(getattr(fwd_s, f"{fwd_unique_id}_reserved")))
+            setattr(
+                bwd_s, f"{unique_id}_reserved_size",
+                ctypes.c_void_p(
+                    getattr(fwd_s, f"{fwd_unique_id}_reserved_size")))
+
+            pass
+
+        context.backward_generator.post_compile_hooks[
+            f"init_{unique_id}"] = post_compile_hook
+
         tasklet_code = f"""
         {environments.cuDNN.handle_setup_code(forward_node)}
         float alpha = 1.f;
         float beta = 0.f;
 
-        float _dYc;
-        float _Xc;
-        float _scalec;
-        float _dXc;
-        float _dScalec;
-        float _dBiasc;
-
-        cudaMemcpyAsync(&_dYc, _dY, 4, cudaMemcpyDeviceToHost, nullptr);
-        cudaMemcpyAsync(&_Xc, _X, 4, cudaMemcpyDeviceToHost, nullptr);
-        cudaMemcpyAsync(&_scalec, _scale, 4, cudaMemcpyDeviceToHost, nullptr);
-        cudaMemcpyAsync(&_dXc, _dX, 4, cudaMemcpyDeviceToHost, nullptr);
-        cudaMemcpyAsync(&_dScalec, _dScale, 4, cudaMemcpyDeviceToHost, nullptr);
-        cudaMemcpyAsync(&_dBiasc, _dBias, 4, cudaMemcpyDeviceToHost, nullptr);
-
-        daceml::cudnn::CheckCudnnError(cudnnBatchNormalizationBackward(
+        daceml::cudnn::CheckCudnnError(cudnnBatchNormalizationBackwardEx(
             __dace_cudnn_handle,
             CUDNN_BATCHNORM_SPATIAL,
+            CUDNN_BATCHNORM_OPS_BN,
             &alpha,
             &beta,
             &alpha,
             &beta,
             *__state->{unique_id}_X_desc,
             _X,
+            nullptr,
+            nullptr,
             *__state->{unique_id}_dY_desc,
             _dY,
+            nullptr,
+            nullptr,
             *__state->{unique_id}_dX_desc,
             _dX,
             *__state->{unique_id}_dScale_desc,
             _scale,
+            nullptr,
             _dScale,
             _dBias,
             {forward_node.epsilon},
+            _saved_mean,
+            _saved_var,
             nullptr,
-            nullptr));
+            __state->{unique_id}_workspace,
+            *__state->{unique_id}_workspace_size,
+            __state->{unique_id}_reserved,
+            *__state->{unique_id}_reserved_size
+            ));
         """
 
-        in_connectors = ["X", "dY", "scale"]
+        in_connectors = ["X", "dY", "scale", "saved_mean", "saved_var"]
         out_connectors = ["dX", "dScale", "dBias"]
         tasklet = nstate.add_tasklet(
             unique_id, {f"_{i}": dace.pointer(T)
@@ -431,10 +485,10 @@ class CuDNNBatchNormBackward(BackwardImplementation):
         arr_name = result.given_grad_names["Y"]
         nstate.add_edge(nstate.add_read(arr_name), None, tasklet, f"_dY",
                         nsdfg.make_array_memlet(arr_name))
-        nstate.add_edge(nstate.add_read("X"), None, tasklet, f"_X",
-                        nsdfg.make_array_memlet("X"))
-        nstate.add_edge(nstate.add_read("scale"), None, tasklet, f"_scale",
-                        nsdfg.make_array_memlet("scale"))
+
+        for arr_name in ["X", "saved_mean", "scale", "saved_var"]:
+            nstate.add_edge(nstate.add_read(arr_name), None, tasklet,
+                            f"_{arr_name}", nsdfg.make_array_memlet(arr_name))
 
         # connect outputs
         arr_name = result.required_grad_names["X"]
@@ -447,8 +501,14 @@ class CuDNNBatchNormBackward(BackwardImplementation):
         nstate.add_edge(tasklet, "_dBias", nstate.add_write(arr_name), None,
                         nsdfg.make_array_memlet(arr_name))
 
-        node = context.backward_state.add_nested_sdfg(
-            nsdfg, None, {"X", result.given_grad_names["Y"], "scale"},
-            {result.required_grad_names[a]
-             for a in {"X", "scale", "B"}})
+        node = context.backward_state.add_nested_sdfg(nsdfg, None, {
+            "X", result.given_grad_names["Y"], "scale", "saved_mean",
+            "saved_var"
+        }, {result.required_grad_names[a]
+            for a in {"X", "scale", "B"}})
+
+        butils.connect_output_from_forward(forward_node, node, context,
+                                           "saved_mean")
+        butils.connect_output_from_forward(forward_node, node, context,
+                                           "saved_var")
         return node, result

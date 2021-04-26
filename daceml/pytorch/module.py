@@ -213,7 +213,7 @@ class DaceModule(nn.Module):
 
             if self.backward:
                 from daceml.autodiff.pytorch import make_backward_function
-                function = make_backward_function(self)
+                hooks, function = make_backward_function(self)
 
                 for _, hook in self.post_autodiff_hooks.items():
                     hook(function._forward_model.sdfg, function._backward_sdfg)
@@ -223,6 +223,10 @@ class DaceModule(nn.Module):
                 function._forward_sdfg = self.dace_onnx_model.compile_and_init(
                 )
                 function._backward_sdfg = function._backward_sdfg.compile()
+                function._backward_sdfg.initialize()
+
+                for _, hook in hooks.items():
+                    hook(function._forward_sdfg, function._backward_sdfg)
 
                 def forward(*args):
                     return function.apply(*args, *self.sdfg_inputs_ordered)
