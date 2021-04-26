@@ -93,21 +93,21 @@ def test_bn(gpu, sdfg_name):
 
 
 @pytest.mark.pure
-def test_mbconv(gpu):
-    if gpu:
-        donnx.ONNXConv.default_implementation = "cuDNN"
-    inputs = torch.rand(1, 32, 224, 224)
+def test_mbconv():
+    donnx.ONNXConv.default_implementation = "cuDNN"
+    donnx.ONNXBatchNormalization.default_implementation = "cuDNN"
+    inputs = torch.rand(1, 32, 224, 224).cuda()
 
     block_params, global_params = get_model_params("efficientnet-b0", {})
 
-    pt_model = MBConvBlock(block_params[0], global_params)
+    pt_model = MBConvBlock(block_params[0], global_params).cuda()
     pt_model.set_swish(memory_efficient=False)
-    dace_model = MBConvBlock(block_params[0], global_params)
+    dace_model = MBConvBlock(block_params[0], global_params).cuda()
     dace_model.set_swish(memory_efficient=False)
 
     dace_model.load_state_dict(pt_model.state_dict())
 
-    dace_model = DaceModule(dace_model, cuda=gpu)
+    dace_model = DaceModule(dace_model, cuda=True)
     dace_model.prepend_post_onnx_hook(
         "cf",
         lambda onnx_model: onnx_model.sdfg.apply_transformations_repeated(
@@ -118,7 +118,20 @@ def test_mbconv(gpu):
             validate_all=True,
             strict=True))
 
+    def param_to_trans(model):
+        for name, _ in itertools.chain(model.pytorch_model.named_buffers(),
+                                       model.pytorch_model.named_parameters()):
+            if "num_batches_tracked" not in name:
+                parameter_to_transient(model, name)
+
+    dace_model.append_post_onnx_hook("param_to_transient", param_to_trans)
+
     dace_output = dace_model(inputs)
     pt_output = pt_model(inputs)
 
     torch_tensors_close("output", pt_output, dace_output)
+
+    torch_tensors_close("mean", pt_model._bn1.running_mean,
+                        dace_model.pytorch_model._bn1.running_mean)
+    torch_tensors_close("var", pt_model._bn1.running_var,
+                        dace_model.pytorch_model._bn1.running_var)
