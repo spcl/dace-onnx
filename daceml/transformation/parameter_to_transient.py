@@ -87,20 +87,21 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
             ptr, compiled_sdfg.sdfg.arrays[gpu_array_name])
         torch_tensor[:] = pt_tensor
 
-        # get the parent of the parameter
-        split_path = parameter_path.split(".")
-        last_name = split_path[-1]
-        previous_names = ".".join(split_path[:-1])
-        if previous_names:
-            param_parent = operator.attrgetter(previous_names)(
-                dace_module.pytorch_model)
-        else:
-            param_parent = dace_module.pytorch_model
-
-        if isinstance(pt_tensor, nn.Parameter):
-            torch_tensor = nn.Parameter(torch_tensor,
-                                        requires_grad=pt_tensor.requires_grad)
-        setattr(param_parent, last_name, torch_tensor)
+        # TODO this is nice but segfaults on python exit :(
+        # # get the parent of the parameter
+        # split_path = parameter_path.split(".")
+        # last_name = split_path[-1]
+        # previous_names = ".".join(split_path[:-1])
+        # if previous_names:
+        #     param_parent = operator.attrgetter(previous_names)(
+        #         dace_module.pytorch_model)
+        # else:
+        #     param_parent = dace_module.pytorch_model
+        #
+        # if isinstance(pt_tensor, nn.Parameter):
+        #     torch_tensor = nn.Parameter(torch_tensor,
+        #                                 requires_grad=pt_tensor.requires_grad)
+        # setattr(param_parent, last_name, torch_tensor)
 
     dace_module.dace_onnx_model.post_compile_hooks[
         "init_" + pt_weight_name] = post_compile_hook

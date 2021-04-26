@@ -221,7 +221,8 @@ def remove_output_connector(sdfg: dace.SDFG, state: dace.SDFGState,
         :param node: the node
         :param conn_name: the name of the connector to remove
     """
-    queue = collections.deque(e.dst for e in state.out_edges_by_connector(node, conn_name))
+    queue = collections.deque(
+        e.dst for e in state.out_edges_by_connector(node, conn_name))
     while len(queue) > 0:
         current_node = queue.popleft()
 
@@ -230,6 +231,7 @@ def remove_output_connector(sdfg: dace.SDFG, state: dace.SDFGState,
         for e in edges:
             if not sdfg.arrays[e.data.data].transient:
                 raise ValueError(
-                    "Tried to remove a connector that wrote to a non-transient")
+                    "Tried to remove a connector that wrote to a non-transient"
+                )
 
             queue.append(e.dst)

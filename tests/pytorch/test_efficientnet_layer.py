@@ -1,4 +1,5 @@
 import copy
+import gc
 import itertools
 import math
 from contextlib import suppress
@@ -58,39 +59,41 @@ def bn_numpy(X, scale, B, in_mean, in_var, Y, out_mean, out_var, saved_mean,
     Y[:] = normalized * scale_reshaped + bias_reshaped
 
 
-# @pytest.mark.pure
-# def test_bn(gpu, sdfg_name):
-#     with change_default(donnx.ONNXBatchNormalization,
-#                         "cuDNN") if gpu else suppress():
-#         torch.random.manual_seed(42)
-#         inputs = torch.rand(1, 64, 60, 60)
-#
-#         pt_model = nn.BatchNorm2d(64)
-#         dace_model = nn.BatchNorm2d(64)
-#
-#         dace_model.load_state_dict(pt_model.state_dict())
-#
-#         dace_model = DaceModule(dace_model, cuda=gpu, sdfg_name=sdfg_name)
-#         if gpu:
-#
-#             def param_to_trans(model):
-#                 for name, _ in itertools.chain(
-#                         model.pytorch_model.named_buffers(),
-#                         model.pytorch_model.named_parameters()):
-#                     if name != "num_batches_tracked":
-#                         parameter_to_transient(model, name)
-#
-#             dace_model.append_post_onnx_hook("param_to_transient",
-#                                              param_to_trans)
-#         dace_model.append_post_onnx_hook("view", lambda m: m.sdfg.view())
-#         dace_output = dace_model(inputs.cuda())
-#         pt_output = pt_model(inputs)
-#
-#         torch_tensors_close("output", pt_output, dace_output.cpu())
-#         torch_tensors_close("mean", pt_model.running_mean,
-#                             dace_model.pytorch_model.running_mean.cpu())
-#         torch_tensors_close("var", pt_model.running_var,
-#                             dace_model.pytorch_model.running_var.cpu())
+@pytest.mark.gpu
+@pytest.mark.pure
+def test_bn(sdfg_name):
+    with change_default(donnx.ONNXBatchNormalization, "cuDNN"):
+        torch.random.manual_seed(42)
+        inputs = torch.rand(1, 64, 60, 60).cuda()
+
+        pt_model = nn.BatchNorm2d(64).cuda()
+        dace_model = nn.BatchNorm2d(64).cuda()
+
+        dace_model.load_state_dict(pt_model.state_dict())
+
+        dace_model = DaceModule(dace_model, cuda=True, sdfg_name=sdfg_name)
+
+        def param_to_trans(model):
+            for name, _ in model.pytorch_model.named_parameters():
+                parameter_to_transient(model, name)
+
+        dace_model.append_post_onnx_hook("param_to_transient", param_to_trans)
+        dace_model.append_post_onnx_hook("view", lambda m: m.sdfg.view())
+        dace_output = dace_model(inputs.cuda())
+        pt_output = pt_model(inputs)
+
+        torch_tensors_close("output", pt_output, dace_output)
+        torch_tensors_close("mean", pt_model.running_mean,
+                            dace_model.pytorch_model.running_mean)
+        torch_tensors_close("var", pt_model.running_var,
+                            dace_model.pytorch_model.running_var)
+        print('deleting dace_model')
+        del dace_model
+        gc.collect()
+        print('deleting pt_model')
+        del pt_model
+        gc.collect()
+        print("done")
 
 
 @pytest.mark.pure
@@ -112,11 +115,8 @@ def test_bn_training(sdfg_name):
                                 backward=True)
 
         def param_to_trans(model):
-            for name, _ in itertools.chain(
-                    model.pytorch_model.named_buffers(),
-                    model.pytorch_model.named_parameters()):
-                if name != "num_batches_tracked":
-                    parameter_to_transient(model, name)
+            for name, _ in model.pytorch_model.named_parameters():
+                parameter_to_transient(model, name)
 
         dace_model.append_post_onnx_hook("param_to_transient", param_to_trans)
         dace_model.append_post_onnx_hook("view", lambda m: m.sdfg.view())
@@ -219,10 +219,8 @@ def test_mbconv():
             strict=True))
 
     def param_to_trans(model):
-        for name, _ in itertools.chain(model.pytorch_model.named_buffers(),
-                                       model.pytorch_model.named_parameters()):
-            if "num_batches_tracked" not in name:
-                parameter_to_transient(model, name)
+        for name, _ in model.pytorch_model.named_parameters():
+            parameter_to_transient(model, name)
 
     dace_model.append_post_onnx_hook("param_to_transient", param_to_trans)
 
@@ -240,4 +238,5 @@ def test_mbconv():
 
 
 if __name__ == '__main__':
-    test_mbconv_training("debugging")
+    #test_mbconv_training("debugging")
+    test_bn("debugging")

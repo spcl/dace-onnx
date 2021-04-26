@@ -1,4 +1,5 @@
 import logging
+import itertools
 from collections import OrderedDict
 from typing import Type, Tuple, Dict, Callable
 
@@ -154,6 +155,7 @@ def make_backward_function(
             # if any(not inp.is_contiguous() for inp in args):
             #     log.warning("forced to copy input since it was not contiguous")
 
+            ctx.num_args = len(args)
             copied_args = tuple(inp if inp.is_contiguous else inp.contiguous()
                                 for inp in args)
 
@@ -251,6 +253,7 @@ def make_backward_function(
                                         **parameter_grad_values,
                                         **backward_inputs, **given_grads)
 
-            return tuple(input_grad_values.values())
+            return (*input_grad_values.values(), *itertools.repeat(
+                None, ctx.num_args - len(input_grad_values)))
 
     return gen.post_compile_hooks, DaceFunction
