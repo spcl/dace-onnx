@@ -420,6 +420,40 @@ def test_reciprocal(sdfg_name):
 
 
 @pytest.mark.pure
+def test_sigmoid(sdfg_name):
+    X = np.random.normal(scale=10, size=(2, 4, 10)).astype(np.float32)
+
+    numpy_result = 1.0 / (1.0 + np.exp(-X))
+    sdfg = dace.SDFG(sdfg_name)
+
+    sdfg.add_array("X", [2, 4, 10], dace.float32)
+    sdfg.add_array("__return", numpy_result.shape, dace.float32)
+
+    state = sdfg.add_state()
+    access_X = state.add_access("X")
+    access_result = state.add_access("__return")
+
+    op_node = donnx.ONNXSigmoid("sigmoid")
+
+    state.add_node(op_node)
+    state.add_edge(access_X, None, op_node, "X", sdfg.make_array_memlet("X"))
+
+    state.add_edge(op_node, "Y", access_result, None,
+                   sdfg.make_array_memlet("__return"))
+
+    sdfg.expand_library_nodes()
+
+    # check that the expansion worked. The default ORT expansion wouldn't produce a map
+    assert any(
+        isinstance(n, dace.nodes.MapEntry)
+        for n, _ in sdfg.all_nodes_recursive())
+
+    result = sdfg(X=X)
+
+    assert np.allclose(numpy_result, result)
+
+
+@pytest.mark.pure
 def test_einsum():
     @dace.program
     def test_einsum(A: dace.float64[5, 4, 3], B: dace.float64[3, 2]):

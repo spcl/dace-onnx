@@ -84,9 +84,11 @@ class ConstantDeviceCopyElimination(transformation.Transformation):
 
         state.remove_node(host_node)
 
+        parent.weights[device_node.data] = parent.weights[onnx_host_name]
+
         def initialization_hook(_):
-            parent.weights[
-                device_node.data] = parent.weights[onnx_host_name].cuda()
+            parent.weights[device_node.data] = parent.weights[
+                device_node.data].cuda()
 
         parent.post_compile_hooks[
             f"copy_constant_{onnx_host_name}"] = initialization_hook

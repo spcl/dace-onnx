@@ -29,6 +29,10 @@ def _get_tensor_layout(desc: dt.Array) -> Optional[str]:
         :return: "NCHW", "NHWC" or None.
     """
 
+    if len(desc.shape) == 1:
+        # just return anything
+        return "NCHW"
+
     if len(desc.shape) != 4:
         raise ValueError("Tensor with dimension != 4 is not supported")
 
@@ -66,6 +70,13 @@ def _cudnn_tensor_descriptor_code(desc: dt.Array, state_field_name: str,
 
     # detect layout
     layout = _get_tensor_layout(desc)
+    if len(desc.shape) == 4:
+        shape = desc.shape
+    elif len(desc.shape) < 4:
+        shape = list(desc.shape) + [1] * (4 - len(desc.shape))
+    else:
+        raise ValueError("Tensor with dimension > 4 is not supported")
+
     assert layout is not None, "layout changed after can_be_applied"
     f_or_t_str = 'Filter' if filter else 'Tensor'
 
@@ -78,7 +89,7 @@ def _cudnn_tensor_descriptor_code(desc: dt.Array, state_field_name: str,
         *__state->{state_field_name}, 
         {dtype_str if filter else layout_str},
         {layout_str if filter else dtype_str},
-        {",".join(str(s) for s in desc.shape)}
+        {",".join(str(s) for s in shape)}
     ));
     """
     exit_code = f"""\
@@ -147,6 +158,12 @@ class CudnnConvolution(ONNXForward):
             # check that the layout is supported by cudnn
             if name != "B" and _get_tensor_layout(desc) is None:
                 return False
+
+        # padding must be symmetric
+        if node.pads[0] != node.pads[2]:
+            return False
+        if node.pads[1] != node.pads[3]:
+            return False
 
         return True
 
@@ -235,7 +252,8 @@ class CudnnConvolution(ONNXForward):
             algo = CudnnConvolution.default_algorithm
 
         # setup conv descriptor
-        pad_h, pad_w = 0, 0
+        # we know padding is symmetric
+        pad_h, pad_w = node.pads[0], node.pads[1]
         stride_h, stride_w = node.strides
         dilation_h, dilation_w = node.dilations
         Environment.init_code += f"""
@@ -494,12 +512,12 @@ class CudnnBatchNormalizationTraining(ONNXForward):
             nstate.add_edge(tasklet, f"_{outp}", outputs[outp], None,
                             nsdfg.make_array_memlet(outp))
 
+        remove_output_connector(sdfg, state, node, "out_mean")
+        remove_output_connector(sdfg, state, node, "out_var")
+
         for outp, anode in outputs.items():
             if f"_{outp}" not in tasklet.out_connectors:
                 nstate.remove_node(anode)
                 del node.out_connectors[outp]
-
-        remove_output_connector(sdfg, state, node, "out_mean")
-        remove_output_connector(sdfg, state, node, "out_var")
 
         return nsdfg

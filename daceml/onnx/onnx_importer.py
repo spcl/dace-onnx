@@ -426,6 +426,7 @@ class ONNXModel:
         """ Compile the SDFG and load parameters into GPU memory. """
 
         compiled_sdfg = self.sdfg.compile()
+        compiled_sdfg.initialize()
         for _, hook in self.post_compile_hooks.items():
             hook(compiled_sdfg)
         return compiled_sdfg

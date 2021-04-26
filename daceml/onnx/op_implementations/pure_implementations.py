@@ -55,6 +55,27 @@ class PureSqrt(ONNXForward):
         return program_for_node(prog, sdfg, state, node)
 
 
+@op_implementation(op="Sigmoid", name="pure")
+class PureSigmoid(ONNXForward):
+    @staticmethod
+    def forward_can_be_applied(node: onnx_op.ONNXOp, state: SDFGState,
+                               sdfg: SDFG) -> bool:
+        return in_desc_with_name(node, state, sdfg, 'X').dtype in [
+            dace.float16, dace.float32, dace.float64
+        ]
+
+    @staticmethod
+    def forward(node: onnx_op.ONNXOp, state: SDFGState,
+                sdfg: SDFG) -> typing.Union[Node, SDFG]:
+        dtype = in_desc_with_name(node, state, sdfg, "X").dtype
+
+        def prog(X, Y):
+            Y[:] = dace.elementwise(lambda x: dtype(1) / (dtype(1) + exp(-x)),
+                                    X)
+
+        return program_for_node(prog, sdfg, state, node)
+
+
 @op_implementation(op="Pow", name="pure")
 class PurePow(ONNXForward):
     @staticmethod

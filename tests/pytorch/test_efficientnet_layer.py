@@ -18,6 +18,7 @@ import daceml.onnx as donnx
 from daceml.pytorch import DaceModule
 from daceml.testing.utils import torch_tensors_close
 from daceml.transformation import ConstantFolding, ConstantDeviceCopyElimination, parameter_to_transient
+from daceml.transformation.pad_conv_fusion import PadConvFusion
 
 
 def test_cudnn_conv():
@@ -151,8 +152,8 @@ def test_mbconv_training(sdfg_name):
     with change_default(donnx.ONNXBatchNormalization, "cuDNN"), \
          change_default(donnx.ONNXConv, "cuDNN"):
         torch.random.manual_seed(42)
-        inputs = torch.rand(1, 64, 60, 60, requires_grad=True).cuda()
-        dy = torch.rand(1, 64, 60, 60).cuda()
+        inputs = torch.rand(1, 32, 60, 60, requires_grad=True).cuda()
+        dy = torch.rand(1, 16, 60, 60).cuda()
 
         block_params, global_params = get_model_params("efficientnet-b0", {})
 
@@ -169,7 +170,7 @@ def test_mbconv_training(sdfg_name):
             lambda onnx_model: onnx_model.sdfg.apply_transformations_repeated(
                 {
                     ConstantFolding, RedundantSecondArray,
-                    ConstantDeviceCopyElimination
+                    ConstantDeviceCopyElimination, PadConvFusion
                 },
                 validate_all=True,
                 strict=True))
@@ -191,6 +192,7 @@ def test_mbconv_training(sdfg_name):
 
 @pytest.mark.pure
 def test_mbconv():
+    donnx.default_implementation = "pure"
     donnx.ONNXConv.default_implementation = "cuDNN"
     donnx.ONNXBatchNormalization.default_implementation = "cuDNN"
     inputs = torch.rand(8, 32, 224, 224).cuda()
@@ -205,13 +207,13 @@ def test_mbconv():
 
     dace_model.load_state_dict(pt_model.state_dict())
 
-    dace_model = DaceModule(dace_model, cuda=True, backward=True)
+    dace_model = DaceModule(dace_model, cuda=True)
     dace_model.prepend_post_onnx_hook(
         "cf",
         lambda onnx_model: onnx_model.sdfg.apply_transformations_repeated(
             {
                 ConstantFolding, RedundantSecondArray,
-                ConstantDeviceCopyElimination
+                ConstantDeviceCopyElimination, PadConvFusion
             },
             validate_all=True,
             strict=True))
@@ -236,5 +238,6 @@ def test_mbconv():
         if "num_batches_tracked" not in pt_name:
             torch_tensors_close(pt_name, pt_buf, dace_buf)
 
-    pt_model.backward(dy)
-    dace_model.backward(dy)
+
+if __name__ == '__main__':
+    test_mbconv_training("debugging")

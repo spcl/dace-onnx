@@ -73,10 +73,6 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
         # remove the CPU node
         state.remove_node(cand)
 
-    if "initialize_hook" not in dace_module.dace_onnx_model.post_compile_hooks:
-        dace_module.dace_onnx_model.post_compile_hooks[
-            "initialize_hook"] = lambda sdfg: sdfg.initialize()
-
     def post_compile_hook(compiled_sdfg):
         struct = compiled_sdfg.get_state_struct()
 
