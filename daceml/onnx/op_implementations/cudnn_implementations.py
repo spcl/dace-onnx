@@ -9,7 +9,7 @@ from daceml.onnx.converters import clean_onnx_name
 from daceml.onnx.forward_implementation_abc import ONNXForward
 from daceml.onnx.nodes import onnx_op
 from daceml.onnx.op_implementations import op_implementation, empty_sdfg_for_node
-from daceml.util import in_desc_with_name, out_desc_with_name
+from daceml.util import in_desc_with_name, out_desc_with_name, remove_output_connector
 
 
 def _prod(sequence):
@@ -359,7 +359,6 @@ class CudnnBatchNormalizationTraining(ONNXForward):
             cmake_link_flags = []
             cmake_files = []
             state_fields = [
-                f"cudnnConvolutionDescriptor_t *{unique_id}_conv_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
                 f"cudnnTensorDescriptor_t *{unique_id}_scale_desc;",
@@ -444,5 +443,10 @@ class CudnnBatchNormalizationTraining(ONNXForward):
 
         nstate.add_edge(tasklet, "_Y", outputs["Y"], None,
                         nsdfg.make_array_memlet("Y"))
+
+        remove_output_connector(sdfg, state, node, "out_mean")
+        remove_output_connector(sdfg, state, node, "out_var")
+        remove_output_connector(sdfg, state, node, "saved_mean")
+        remove_output_connector(sdfg, state, node, "saved_var")
 
         return nsdfg

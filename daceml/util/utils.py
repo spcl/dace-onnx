@@ -1,6 +1,7 @@
 import functools
 import logging
 import typing
+import operator
 from functools import wraps
 
 import dace
@@ -18,6 +19,18 @@ from daceml.onnx.nodes.onnx_op import ONNXOp
 from daceml import transformation
 
 log = logging.getLogger(__name__)
+
+
+def nested_getattr(obj, name):
+    return operator.attrgetter(name)(obj)
+
+
+def nested_hasattr(obj, name):
+    try:
+        nested_getattr(obj, name)
+        return True
+    except AttributeError:
+        return False
 
 
 def is_desc_contiguous(desc: dt.Data) -> bool:
@@ -196,3 +209,26 @@ def find_unclean_onnx_name(model: 'daceml.onnx.onnx_importer.ONNXModel',
     if len(unclean_name) != 1:
         raise ValueError(f"Could not find unclean name for name {name}")
     return unclean_name[0]
+
+
+def remove_output_connector(sdfg: dace.SDFG, state: dace.SDFGState,
+                            node: nd.Node, conn_name: str):
+    """ Remove an output connector (only possible if the connector doesn't write to a non-transient).
+
+        :param sdfg: the sdfg containing the node.
+        :param state: the state containing the node.
+        :param node: the node
+        :param conn_name: the name of the connector to remove
+    """
+    nodes_to_remove = []
+    for e in state.bfs_edges(node):
+        if e.src is node and e.src_conn != conn_name:
+            continue
+        if not sdfg.arrays[e.data.data].transient:
+            raise ValueError(
+                "Tried to remove a connector that wrote to a non-transient")
+
+        nodes_to_remove.append(e.dst)
+
+    for n in nodes_to_remove:
+        state.remove_node(n)

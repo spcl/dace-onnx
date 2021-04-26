@@ -1,14 +1,16 @@
 import copy
 import itertools
+import typing
 from typing import List, Optional, Tuple, Dict, Union
 
 import dace
 from dace.frontend.common import einsum
 from dace.registry import autoregister_params
-import dace.sdfg.nodes as nd
+from dace import nodes as nd, dtypes
 
 import daceml.onnx as donnx
-from daceml.onnx.op_implementations import pure_implementations
+from daceml.onnx.op_implementations import pure_implementations, cudnn_implementations, empty_sdfg_for_node, \
+    clean_onnx_name, environments
 import daceml.autodiff.utils as butils
 from daceml.autodiff.base_abc import BackwardImplementation, BackwardContext, BackwardResult
 
@@ -259,4 +261,194 @@ class PureReluBackward(BackwardImplementation):
         node = context.backward_state.add_nested_sdfg(new_sdfg, None,
                                                       {"Y_grad", "X"},
                                                       {"X_grad"})
+        return node, result
+
+
+@autoregister_params(op="BatchNormalization", name="cuDNN")
+class CuDNNBatchNormBackward(BackwardImplementation):
+    @staticmethod
+    def backward_can_be_applied(node: nd.Node, state: dace.SDFGState,
+                                sdfg: dace.SDFG) -> bool:
+        return cudnn_implementations.CudnnBatchNormalizationTraining.forward_can_be_applied(
+            node, state, sdfg)
+
+    @staticmethod
+    def backward(
+        forward_node: nd.Node, context: BackwardContext,
+        given_gradients: typing.List[typing.Optional[str]],
+        required_gradients: typing.List[typing.Optional[str]]
+    ) -> typing.Tuple[nd.Node, BackwardResult]:
+
+        nsdfg = dace.SDFG(forward_node.label + "_backward")
+        X_desc = butils.forward_in_desc_with_name(forward_node, context, "X")
+        scale_desc = butils.forward_in_desc_with_name(forward_node, context,
+                                                      "scale")
+        T = X_desc.dtype
+
+        # setup arrays
+        result = BackwardResult.empty()
+        result.required_grad_names["X"] = butils.add_backward_desc(
+            nsdfg, context.forward_sdfg, X_desc, "X")
+        result.given_grad_names["Y"] = butils.add_backward_desc_for_connector(
+            nsdfg, forward_node, context, "Y", input=False)
+        result.required_grad_names[
+            "scale"] = butils.add_backward_desc_for_connector(nsdfg,
+                                                              forward_node,
+                                                              context,
+                                                              "scale",
+                                                              input=True)
+        result.required_grad_names[
+            "B"] = butils.add_backward_desc_for_connector(nsdfg,
+                                                          forward_node,
+                                                          context,
+                                                          "B",
+                                                          input=True)
+
+        # input X
+        new_X_desc = copy.deepcopy(X_desc)
+        new_X_desc.transient = False
+        nsdfg.add_datadesc("X", new_X_desc)
+
+        # input scale
+        new_scale_desc = copy.deepcopy(scale_desc)
+        new_scale_desc.transient = False
+        nsdfg.add_datadesc("scale", new_scale_desc)
+
+        # setup state
+        nstate = nsdfg.add_state()
+        fwd_unique_id = "{}_{}_{}_{}".format(
+            clean_onnx_name(forward_node.name), context.forward_sdfg.sdfg_id,
+            context.forward_sdfg.node_id(context.forward_state),
+            context.forward_state.node_id(forward_node))
+
+        unique_id = f"{fwd_unique_id}_bwd"
+
+        class Environment:
+            cmake_minimum_version = None
+            cmake_packages = []
+            cmake_variables = {}
+            cmake_includes = []
+            cmake_libraries = []
+            cmake_compile_flags = []
+            cmake_link_flags = []
+            cmake_files = []
+            state_fields = [
+                f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_dX_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_dY_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_dScale_desc;",
+            ]
+            dependencies = [environments.cuDNN]
+            headers = []
+            init_code = ""
+            finalize_code = ""
+
+        Environment.__name__ = unique_id + "_environment"
+        dace.library.environment(Environment)
+
+        init, exit = cudnn_implementations._cudnn_tensor_descriptor_code(
+            new_X_desc, f"{unique_id}_X_desc", False)
+        Environment.init_code += init
+        Environment.finalize_code += exit
+
+        dX_desc = nsdfg.arrays[result.required_grad_names["X"]]
+        init, exit = cudnn_implementations._cudnn_tensor_descriptor_code(
+            dX_desc, f"{unique_id}_dX_desc", False)
+        Environment.init_code += init
+        Environment.finalize_code += exit
+
+        dY_desc = nsdfg.arrays[result.given_grad_names["Y"]]
+        init, exit = cudnn_implementations._cudnn_tensor_descriptor_code(
+            dY_desc, f"{unique_id}_dY_desc", False)
+        Environment.init_code += init
+        Environment.finalize_code += exit
+
+        # setup scale descriptor
+        Environment.init_code += f"""
+        __state->{unique_id}_dScale_desc = new cudnnTensorDescriptor_t; 
+        daceml::cudnn::CheckCudnnError(cudnnCreateTensorDescriptor(__state->{unique_id}_dScale_desc));
+        daceml::cudnn::CheckCudnnError(cudnnDeriveBNTensorDescriptor(
+            *__state->{unique_id}_dScale_desc,
+            *__state->{unique_id}_X_desc,
+            CUDNN_BATCHNORM_SPATIAL));
+        """
+        Environment.finalize_code += f"""
+        daceml::cudnn::CheckCudnnError(cudnnDestroyTensorDescriptor(*__state->{unique_id}_dScale_desc));
+        delete __state->{unique_id}_dScale_desc;
+        """
+
+        tasklet_code = f"""
+        {environments.cuDNN.handle_setup_code(forward_node)}
+        float alpha = 1.f;
+        float beta = 0.f;
+
+        float _dYc;
+        float _Xc;
+        float _scalec;
+        float _dXc;
+        float _dScalec;
+        float _dBiasc;
+
+        cudaMemcpyAsync(&_dYc, _dY, 4, cudaMemcpyDeviceToHost, nullptr);
+        cudaMemcpyAsync(&_Xc, _X, 4, cudaMemcpyDeviceToHost, nullptr);
+        cudaMemcpyAsync(&_scalec, _scale, 4, cudaMemcpyDeviceToHost, nullptr);
+        cudaMemcpyAsync(&_dXc, _dX, 4, cudaMemcpyDeviceToHost, nullptr);
+        cudaMemcpyAsync(&_dScalec, _dScale, 4, cudaMemcpyDeviceToHost, nullptr);
+        cudaMemcpyAsync(&_dBiasc, _dBias, 4, cudaMemcpyDeviceToHost, nullptr);
+
+        daceml::cudnn::CheckCudnnError(cudnnBatchNormalizationBackward(
+            __dace_cudnn_handle,
+            CUDNN_BATCHNORM_SPATIAL,
+            &alpha,
+            &beta,
+            &alpha,
+            &beta,
+            *__state->{unique_id}_X_desc,
+            _X,
+            *__state->{unique_id}_dY_desc,
+            _dY,
+            *__state->{unique_id}_dX_desc,
+            _dX,
+            *__state->{unique_id}_dScale_desc,
+            _scale,
+            _dScale,
+            _dBias,
+            {forward_node.epsilon},
+            nullptr,
+            nullptr));
+        """
+
+        in_connectors = ["X", "dY", "scale"]
+        out_connectors = ["dX", "dScale", "dBias"]
+        tasklet = nstate.add_tasklet(
+            unique_id, {f"_{i}": dace.pointer(T)
+                        for i in in_connectors},
+            {f"_{i}": dace.pointer(T)
+             for i in out_connectors}, tasklet_code, dtypes.Language.CPP)
+        tasklet.environments = [Environment.__name__]
+
+        # connect inputs
+        arr_name = result.given_grad_names["Y"]
+        nstate.add_edge(nstate.add_read(arr_name), None, tasklet, f"_dY",
+                        nsdfg.make_array_memlet(arr_name))
+        nstate.add_edge(nstate.add_read("X"), None, tasklet, f"_X",
+                        nsdfg.make_array_memlet("X"))
+        nstate.add_edge(nstate.add_read("scale"), None, tasklet, f"_scale",
+                        nsdfg.make_array_memlet("scale"))
+
+        # connect outputs
+        arr_name = result.required_grad_names["X"]
+        nstate.add_edge(tasklet, "_dX", nstate.add_write(arr_name), None,
+                        nsdfg.make_array_memlet(arr_name))
+        arr_name = result.required_grad_names["scale"]
+        nstate.add_edge(tasklet, "_dScale", nstate.add_write(arr_name), None,
+                        nsdfg.make_array_memlet(arr_name))
+        arr_name = result.required_grad_names["B"]
+        nstate.add_edge(tasklet, "_dBias", nstate.add_write(arr_name), None,
+                        nsdfg.make_array_memlet(arr_name))
+
+        node = context.backward_state.add_nested_sdfg(
+            nsdfg, None, {"X", result.given_grad_names["Y"], "scale"},
+            {result.required_grad_names[a]
+             for a in {"X", "scale", "B"}})
         return node, result

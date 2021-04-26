@@ -27,6 +27,9 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
     if array_name not in dace_module.sdfg.arrays:
         raise ValueError(f"Could not find parameter {array_name} in sdfg.")
 
+    # remove the parameter as an input
+    dace_module.dace_onnx_model.inputs.remove(pt_weight_name)
+
     if dace_module.sdfg.arrays[
             array_name].storage is dtypes.StorageType.GPU_Global:
         dace_module.sdfg.arrays[array_name].transient = True
@@ -34,7 +37,6 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
             array_name].lifetime = dtypes.AllocationLifetime.Persistent
         gpu_array_name = array_name
     else:
-
         # find the GPU transient of this array
         cands = [
             (node, parent)

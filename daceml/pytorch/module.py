@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 from torch.onnx import TrainingMode
 
-from daceml.autodiff.pytorch import make_backward_function
 from daceml.onnx import ONNXModel
 from daceml.onnx.shape_inference import infer_shapes
 from daceml.util import utils, find_str_not_in_set
@@ -207,21 +206,32 @@ class DaceModule(nn.Module):
                 for k, v in self.sdfg_inputs.items()
                 if k in self.dace_onnx_model.inputs
             }
+            self.sdfg_inputs_ordered = [
+                self.sdfg_inputs[k] for k in self.dace_onnx_model.inputs
+                if k in self.sdfg_inputs
+            ]
 
             if self.backward:
-                function = make_backward_function(dace_model)
+                from daceml.autodiff.pytorch import make_backward_function
+                function = make_backward_function(self)
 
                 for _, hook in self.post_autodiff_hooks.items():
                     hook(function._forward_model.sdfg, function._backward_sdfg)
 
+                # initialize and compile the sdfgs
+
+                function._forward_sdfg = self.dace_onnx_model.compile_and_init(
+                )
+                function._backward_sdfg = function._backward_sdfg.compile()
+
                 def forward(*args):
-                    return function.apply(*args, **self.sdfg_inputs)
+                    return function.apply(*args, *self.sdfg_inputs_ordered)
 
                 return forward
             else:
 
                 def forward(*args):
-                    return dace_model(*args, **self.sdfg_inputs)
+                    return dace_model(*args, *self.sdfg_inputs_ordered)
 
                 return forward
 

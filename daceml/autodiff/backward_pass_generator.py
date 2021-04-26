@@ -387,7 +387,10 @@ class BackwardPassGenerator:
 
                             @classmethod
                             def expansion(cls, node, state, sdfg):
-                                return impl.forward(node, state, sdfg)
+                                result = impl.forward(node, state, sdfg)
+                                if hasattr(impl, "environments"):
+                                    Expansion.environments = impl.environments
+                                return result
 
                             @staticmethod
                             def annotates_memlets() -> bool:
