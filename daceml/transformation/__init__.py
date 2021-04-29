@@ -1,3 +1,4 @@
 from .constant_folding import ConstantFolding
 from .parameter_to_transient import parameter_to_transient
 from .constant_gpu_copy_elimination import ConstantDeviceCopyElimination
+from .tasklet_fusion import TaskletFusion

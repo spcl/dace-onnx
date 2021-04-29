@@ -224,6 +224,7 @@ class DaceModule(nn.Module):
                 )
                 function._backward_sdfg = function._backward_sdfg.compile()
                 function._backward_sdfg.initialize()
+                self._autograd_func = function
 
                 for _, hook in hooks.items():
                     hook(function._forward_sdfg, function._backward_sdfg)

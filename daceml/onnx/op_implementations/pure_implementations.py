@@ -625,3 +625,14 @@ class PureLogSoftmax(ONNXForward):
             output[:] = max_sub - log_sum
 
         return program_for_node(prog, sdfg, state, node)
+
+@op_implementation(op="Softplus", name="pure")
+class PureSoftPlus(ONNXForward):
+    @staticmethod
+    def forward(node: onnx_op.ONNXOp, state: SDFGState,
+                sdfg: SDFG) -> typing.Union[nodes.Node, SDFG]:
+
+        def prog(X, Y):
+            Y[:] = np.log(1 + np.exp(X))
+
+        return program_for_node(prog, sdfg, state, node)

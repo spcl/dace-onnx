@@ -117,7 +117,6 @@ def make_backward_function(
         else:
             forward_sdfg.arrays[name].transient = False
 
-    backward_sdfg.view()
     backward_sdfg.validate()
 
     # initialization of the SDFGs
