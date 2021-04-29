@@ -457,7 +457,8 @@ class ONNXModel:
         if self.do_auto_optimize:
             self.auto_optimize()
 
-        self.compiled = self.compile_and_init()
+        if not hasattr(self, "compiled"):
+            self.compiled = self.compile_and_init()
 
         inputs, params, symbols, outputs = self._call_args(args=args,
                                                            kwargs=kwargs)

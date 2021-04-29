@@ -41,24 +41,25 @@ class TaskletFusion(Transformation):
 
     @classmethod
     def expressions(cls):
-        return [node_path_graph(cls.tsk1, cls.data, cls.tsk2)]
+        return [node_path_graph(cls.tsk1, cls.data, cls.tsk2),
+                node_path_graph(cls.tsk1, cls.tsk2)]
 
     def can_be_applied(self, graph: SDFGState, candidate: Dict[PatternNode,
                                                                int],
                        expr_index: int, sdfg: SDFG, strict: bool) -> bool:
         tsk1: nd.Tasklet = self.tsk1(sdfg)
-        data: nd.AccessNode = self.data(sdfg)
+        data: nd.AccessNode = self.data(sdfg) if self.expr_index == 0 else None
         tsk2: nd.Tasklet = self.tsk2(sdfg)
 
         if tsk1.language is not dtypes.Language.Python or tsk2.language is not dtypes.Language.Python:
             return False
 
-        if data.desc(sdfg).total_size != 1:
+        if data is not None and data.desc(sdfg).total_size != 1:
             return False
 
 
         # tsk1 is not used anywhere else
-        if graph.out_degree(tsk1) != 1 or graph.out_degree(data) != 1:
+        if graph.out_degree(tsk1) != 1 or (data is not None and graph.out_degree(data) != 1):
             return False
 
         # tsk2 should have one out connector only
@@ -79,12 +80,11 @@ class TaskletFusion(Transformation):
     def apply(self, sdfg: SDFG) -> nd.Tasklet:
         state: SDFGState = sdfg.node(self.state_id)
         tsk1: nd.Tasklet = self.tsk1(sdfg)
-        data: nd.AccessNode = self.data(sdfg)
+        data: nd.AccessNode = self.data(sdfg) if self.expr_index == 0 else None
         tsk2: nd.Tasklet = self.tsk2(sdfg)
 
 
-        tsk1_out_edge = state.out_edges(tsk1)[0]
-        tsk2_in_edge = state.out_edges(data)[0]
+        tsk2_in_edge = state.out_edges(data if data is not None else tsk1)[0]
 
         # remove the connector from tsk2
         inputs = {k:v for k, v in tsk2.in_connectors.items() if k != tsk2_in_edge.dst_conn}
@@ -126,7 +126,8 @@ class TaskletFusion(Transformation):
             state.add_edge(new_tasklet, out_edge.src_conn, out_edge.dst, out_edge.dst_conn, out_edge.data)
 
         state.remove_node(tsk1)
-        state.remove_node(data)
+        if data is not None:
+            state.remove_node(data)
         state.remove_node(tsk2)
 
 
