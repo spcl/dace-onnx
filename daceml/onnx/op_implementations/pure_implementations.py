@@ -12,7 +12,7 @@ from dace.sdfg.nodes import Node
 from daceml.onnx import converters
 from daceml.onnx.forward_implementation_abc import ONNXForward
 from daceml.onnx.nodes import onnx_op
-from daceml.onnx.op_implementations.utils import op_implementation, program_for_node
+from daceml.onnx.op_implementations.utils import op_implementation, program_for_node, python_pure_op_implementation
 from daceml.transformation import constant_folding
 from daceml.util.utils import in_desc_with_name, out_desc_with_name, in_edge_with_name, iterables_equal
 
@@ -626,13 +626,6 @@ class PureLogSoftmax(ONNXForward):
 
         return program_for_node(prog, sdfg, state, node)
 
-@op_implementation(op="Softplus", name="pure")
-class PureSoftPlus(ONNXForward):
-    @staticmethod
-    def forward(node: onnx_op.ONNXOp, state: SDFGState,
-                sdfg: SDFG) -> typing.Union[nodes.Node, SDFG]:
-
-        def prog(X, Y):
-            Y[:] = np.log(1 + np.exp(X))
-
-        return program_for_node(prog, sdfg, state, node)
+@python_pure_op_implementation
+def Softplus(X, Y):
+    Y[:] = np.log(1 + np.exp(X))

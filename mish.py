@@ -42,16 +42,19 @@ def fuse_sg(module):
     fwd_sdfg.apply_transformations_repeated(TrivialMapRangeElimination)
     SubgraphFusion.apply_to(fwd_sdfg, *fwd_sdfg.node(0).nodes())
 
-dace_func.append_post_onnx_hook("auto_optimize", \
+dace_func.append_post_onnx_hook("auto_optimize",
     lambda dace_module: utils.auto_optimize(dace_module.dace_onnx_model.sdfg,
                                             True,
                                             apply_strict=True))
 dace_func.append_post_onnx_hook("fuse_sg", fuse_sg)
 dace_func.append_post_onnx_hook("fuse_tasklets", lambda x:\
         x.dace_onnx_model.sdfg.apply_transformations_repeated(transformation.TaskletFusion, validate=True))
-dace_func.append_post_onnx_hook("vectorize", \
-                                lambda dace_module: dace_module.sdfg.apply_transformations(Vectorization, validate=True))
-dace_func.append_post_autodiff_hook("view",\
+def vectorize(fwd, bwd):
+    fwd.apply_transformations(Vectorization, validate=True)
+    bwd.apply_transformations(Vectorization, validate=True)
+
+dace_func.append_post_autodiff_hook("vectorize", vectorize)
+dace_func.append_post_autodiff_hook("view",
     lambda f, b: b.view())
 
 
@@ -80,17 +83,27 @@ pt_output = pt_func(pt_inputs)
 dace_output = dace_func(dace_inputs)
 torch.allclose(pt_output, dace_output)
 
+dace_output.backward(dy)
+pt_output.backward(dy)
+
+torch.allclose(dace_inputs.grad, pt_inputs.grad)
+
+
+
 
 # In[5]:
 
 
-#for i in range(1000):
-#    dace_output = dace_func(dace_inputs)
+for i in range(1000):
+    dace_output.grad = None
+    dace_output = dace_func(dace_inputs)
+    dace_output.backward(dy)
     
 #import time
 #time.sleep(5)
-for i in range(1000):
-    pt_output = pt_func(pt_inputs)
+#for i in range(1000):
+#    pt_output = pt_func(pt_inputs)
+#    pt_output.backward(dy)
 
 
 
