@@ -194,6 +194,7 @@ class DaceModule(nn.Module):
             self.dace_onnx_model = dace_model
 
             self.sdfg.validate()
+            self.sdfg.view()
 
             for _, hook in self.post_onnx_hooks.items():
                 hook(self)

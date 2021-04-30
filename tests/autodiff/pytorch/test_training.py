@@ -122,3 +122,8 @@ def test_bert(sdfg_name, gpu):
 
     training_step(BertTokenSoftmaxClf(), BertTokenSoftmaxClf(),
                   (input, labels), sdfg_name, gpu)
+
+
+if __name__ == '__main__':
+    donnx.default_implementation = "pure"
+    test_bert("test_bert", True)

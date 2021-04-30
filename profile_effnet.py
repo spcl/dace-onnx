@@ -26,15 +26,27 @@ dace_model.set_swish(memory_efficient=False)
 dace_model.load_state_dict(pt_model.state_dict())
 
 dace_model = DaceModule(dace_model, cuda=True)
-dace_model.prepend_post_onnx_hook(
-    "cf",
-    lambda onnx_model: onnx_model.sdfg.apply_transformations_repeated(
-        {
-            ConstantFolding, RedundantSecondArray,
-            ConstantDeviceCopyElimination, PadConvFusion
-        },
-        validate_all=True,
-        strict=True))
+def cf(dace_model):
+    dace_model.sdfg.view()
+    dace_model.sdfg.apply_transformations_repeated(
+            {
+                ConstantFolding, RedundantSecondArray,
+                ConstantDeviceCopyElimination, #PadConvFusion
+                },
+            validate_all=True,
+            strict=True)
+    dace_model.sdfg.view()
+dace_model.prepend_post_onnx_hook("cf", cf)
+
+#dace_model.prepend_post_onnx_hook(
+#    "cf",
+#    lambda onnx_model: onnx_model.sdfg.apply_transformations_repeated(
+#        {
+#            ConstantFolding, RedundantSecondArray,
+#            ConstantDeviceCopyElimination, PadConvFusion
+#        },
+#        validate_all=True,
+#        strict=True))
 
 
 def param_to_trans(model):

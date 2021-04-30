@@ -41,6 +41,7 @@ def make_backward_function(
 
     backward_sdfg = dace.SDFG(forward_sdfg.name + "_backward")
     backward_state = backward_sdfg.add_state()
+    forward_sdfg.view()
 
     # we want gradients for all inputs that are not pytorch buffers
     named_buffers = {n for n, _ in model.pytorch_model.named_buffers()}
@@ -117,6 +118,7 @@ def make_backward_function(
         else:
             forward_sdfg.arrays[name].transient = False
 
+    backward_sdfg.view()
     backward_sdfg.validate()
 
     # initialization of the SDFGs
