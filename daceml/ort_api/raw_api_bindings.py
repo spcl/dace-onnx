@@ -5,7 +5,7 @@ import os
 import re
 
 from dace.codegen import codeobject, targets, compiler
-
+from daceml.onnx.environments import ONNXRuntime
 
 class ORTAPIError(RuntimeError):
     """ Error thrown when an ORT function returns a non-zero Status. """
@@ -306,7 +306,7 @@ class ORTCAPIInterface:
                                         "cpp",
                                         targets.cpu.CPUCodeGen,
                                         "ONNXCAPIBriget",
-                                        environments={"ONNXRuntime"})
+                                        environments={ONNXRuntime.full_class_path()})
 
         BUILD_PATH = os.path.join('.dacecache', "onnx_c_api_bridge")
         compiler.generate_program_folder(None, [program], BUILD_PATH)
