@@ -22,6 +22,8 @@ from daceml.onnx.converters import convert_attribute_proto, onnx_tensor_type_to_
 from daceml.onnx.schema import ONNXParameterType
 from daceml.onnx.nodes.onnx_op import get_onnx_node, has_onnx_node, ONNXOp
 from daceml.util import utils, is_cuda
+from dace.transformation import dataflow
+from daceml import transformation
 
 log = logging.getLogger(__name__)
 
@@ -470,6 +472,7 @@ class ONNXModel:
             self.auto_optimize()
 
         compiled = self.compile_and_init()
+
 
         inputs, symbols, outputs = self._call_args(args=args, kwargs=kwargs)
 

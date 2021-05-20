@@ -26,7 +26,7 @@ def parameter_to_transient(dace_module: DaceModule, parameter_path: str):
     array_name = clean_onnx_name(pt_weight_name)
     dace_module.dace_model.inputs.remove(parameter_path)
 
-    # the the access node for this array of this array
+    # Find the access node for this array
     cands = [(node, parent)
              for (node, parent) in dace_module.sdfg.all_nodes_recursive()
              if isinstance(node, nodes.AccessNode) and node.data == array_name]

@@ -2,6 +2,8 @@ import copy
 import itertools
 from typing import List, Optional, Tuple, Dict, Union
 
+import numpy as np
+
 import dace
 from dace.frontend.common import einsum
 from dace.registry import autoregister_params
@@ -129,46 +131,64 @@ class DefaultEinsumBackward(BackwardImplementation):
         return result_node, result
 
 
-@autoregister_params(op="Softmax", name="default")
-class DefaultSoftmaxBackward(BackwardImplementation):
+# @autoregister_params(op="Softmax", name="default")
+# class DefaultSoftmaxBackward(BackwardImplementation):
+#     @staticmethod
+#     def backward(
+#         forward_node: nd.Node, context: BackwardContext,
+#         given_gradients: List[Optional[str]],
+#         required_gradients: List[Optional[str]]
+#     ) -> Tuple[Union[nd.Node, dace.SDFG], BackwardResult]:
+#
+#         dim = forward_node.axis
+#
+#         output_shape = butils.forward_out_desc_with_name(
+#             forward_node, context, "output").shape
+#         output_dtype = butils.forward_out_desc_with_name(
+#             forward_node, context, "output").dtype
+#
+#         sums_shape = list(copy.deepcopy(output_shape))
+#         sums_shape[dim] = 1
+#
+#         def softmax_backward(output, output_grad, input_grad):
+#             prod = dace.define_local(output_shape, output_dtype)
+#             sums = dace.define_local(sums_shape, output_dtype)
+#             donnx.ONNXMul(A=output, B=output_grad, C=prod)
+#             donnx.ONNXReduceSum(data=prod,
+#                                 reduced=sums,
+#                                 keepdims=1,
+#                                 axes=[dim])
+#
+#             donnx.ONNXMul(A=output, B=sums, C=input_grad)
+#             # let's not use ONNXSub here; not sure how this inplace op is handled by ORT...
+#             input_grad[:] = prod - input_grad
+#
+#         result_node, result = butils.backward_program_for_node(
+#             softmax_backward, context, forward_node)
+#
+#         butils.connect_output_from_forward(forward_node, result_node, context,
+#                                            "output")
+#
+#         return result_node, result
+
+@autoregister_params(op="Transpose", name="default")
+class DefaultTransposBackwarde(BackwardImplementation):
     @staticmethod
     def backward(
-        forward_node: nd.Node, context: BackwardContext,
-        given_gradients: List[Optional[str]],
-        required_gradients: List[Optional[str]]
-    ) -> Tuple[Union[nd.Node, dace.SDFG], BackwardResult]:
+            forward_node: nd.Node, context: BackwardContext,
+            given_gradients: List[Optional[str]],
+            required_gradients: List[Optional[str]]
+    ) -> Tuple[nd.Node, BackwardResult]:
+        inv_perm = tuple(np.argsort(forward_node.perm))
 
-        dim = forward_node.axis
+        node = donnx.ONNXTranspose(forward_node.name + "_backward", perm=inv_perm)
+        context.backward_state.add_node(node)
 
-        output_shape = butils.forward_out_desc_with_name(
-            forward_node, context, "output").shape
-        output_dtype = butils.forward_out_desc_with_name(
-            forward_node, context, "output").dtype
+        result = BackwardResult.empty()
+        result.given_grad_names["transposed"] = "data"
+        result.required_grad_names["data"] = "transposed"
 
-        sums_shape = list(copy.deepcopy(output_shape))
-        sums_shape[dim] = 1
-
-        def softmax_backward(output, output_grad, input_grad):
-            prod = dace.define_local(output_shape, output_dtype)
-            sums = dace.define_local(sums_shape, output_dtype)
-            donnx.ONNXMul(A=output, B=output_grad, C=prod)
-            donnx.ONNXReduceSum(data=prod,
-                                reduced=sums,
-                                keepdims=1,
-                                axes=[dim])
-
-            donnx.ONNXMul(A=output, B=sums, C=input_grad)
-            # let's not use ONNXSub here; not sure how this inplace op is handled by ORT...
-            input_grad[:] = prod - input_grad
-
-        result_node, result = butils.backward_program_for_node(
-            softmax_backward, context, forward_node)
-
-        butils.connect_output_from_forward(forward_node, result_node, context,
-                                           "output")
-
-        return result_node, result
-
+        return node, result
 
 @autoregister_params(op="LogSoftmax", name="default")
 class DefaultLogSoftmaxBackward(BackwardImplementation):

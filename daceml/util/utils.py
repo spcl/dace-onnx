@@ -1,12 +1,14 @@
 import functools
 import logging
 import typing
+import collections
 from functools import wraps
 
 import dace
-from dace import nodes as nd
+from dace import config, nodes as nd
 from dace.libraries import blas
 from dace.sdfg.state import MultiConnectorEdge
+from daceml.onnx.converters import clean_onnx_name
 from dace.transformation import interstate, dataflow
 from dace import SDFG, SDFGState, dtypes
 import dace.data as dt
@@ -104,11 +106,12 @@ def find_str_not_in_set(existing: typing.Set[str],
     return base_name + "_" + str(i)
 
 
-def expand_onnx_nodes(sdfg: dace.SDFG):
+def expand_onnx_nodes(sdfg: dace.SDFG, expand_predicate=None):
     """ Recursively expand all onnx library nodes in the SDFG, resulting in an SDFG that can be optimized by
         dace transformations. Will also specialize dace matmuls.
 
         :param sdfg: the sdfg to expand nodes on.
+        :param skip: node types to expand
     """
     # avoid import loop
     from daceml.onnx.nodes.onnx_op import ONNXOp
@@ -119,15 +122,17 @@ def expand_onnx_nodes(sdfg: dace.SDFG):
         expanded_something = False
         for node in list(state.nodes()):  # Make sure we have a copy
             if isinstance(node, nd.NestedSDFG):
-                expand_onnx_nodes(node.sdfg)
-            elif isinstance(node, ONNXOp) or isinstance(node, blas.MatMul):
-                impl_name = node.expand(sdfg, state)
-                print(
-                    "Automatically expanded library node \"{}\" with implementation \"{}\"."
-                    .format(str(node), impl_name))
-                # We made a copy of the original list of nodes, so we keep
-                # iterating even though this list has now changed
-                expanded_something = True
+                expand_onnx_nodes(node.sdfg, expand_predicate=expand_predicate)
+            elif (isinstance(node, ONNXOp) or isinstance(node, blas.MatMul)):
+                if expand_predicate is None or expand_predicate(node):
+                    impl_name = node.expand(sdfg, state)
+                    if config.Config.get_bool('debugprint'):
+                        print(
+                            "Automatically expanded library node \"{}\" with implementation \"{}\"."
+                            .format(str(node), impl_name))
+                    # We made a copy of the original list of nodes, so we keep
+                    # iterating even though this list has now changed
+                    expanded_something = True
         if expanded_something:
             states.append(state)  # Nodes have changed. Check state again
 
@@ -178,6 +183,38 @@ def iterables_equal(a, b) -> bool:
 
 def prod(sequence):
     return functools.reduce(lambda a, b: a * b, sequence, 1)
+
+
+def remove_output_connector(sdfg: dace.SDFG, state: dace.SDFGState,
+                            node: nd.Node, conn_name: str):
+    """ Remove an output connector (only possible if the connector doesn't write to a non-transient).
+        :param sdfg: the sdfg containing the node.
+        :param state: the state containing the node.
+        :param node: the node
+        :param conn_name: the name of the connector to remove
+    """
+    queue = collections.deque(
+        e.dst for e in state.out_edges_by_connector(node, conn_name))
+    while len(queue) > 0:
+        current_node = queue.popleft()
+
+        edges = state.out_edges(current_node)
+        state.remove_node(current_node)
+        for e in edges:
+            if not sdfg.arrays[e.data.data].transient:
+                raise ValueError(
+                    "Tried to remove a connector that wrote to a non-transient"
+                )
+
+            queue.append(e.dst)
+
+
+def find_unclean_onnx_name(model: 'daceml.onnx.onnx_importer.ONNXModel',
+                           name: str) -> str:
+    unclean_name = [n for n in model.weights if clean_onnx_name(n) == name]
+    if len(unclean_name) != 1:
+        raise ValueError(f"Could not find unclean name for name {name}")
+    return unclean_name[0]
 
 
 def is_cuda(storage: dtypes.StorageType) -> bool:

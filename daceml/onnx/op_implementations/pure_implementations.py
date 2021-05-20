@@ -12,7 +12,8 @@ from dace.sdfg.nodes import Node
 from daceml.onnx import converters
 from daceml.onnx.forward_implementation_abc import ONNXForward
 from daceml.onnx.nodes import onnx_op
-from daceml.onnx.op_implementations.utils import op_implementation, program_for_node, empty_sdfg_for_node
+from daceml.onnx.op_implementations.utils import op_implementation, program_for_node, \
+    empty_sdfg_for_node, python_pure_op_implementation
 from daceml.transformation import constant_folding
 from daceml.util.utils import in_desc_with_name, out_desc_with_name, in_edge_with_name, iterables_equal
 
@@ -405,6 +406,38 @@ class PureSoftmax(ONNXForward):
 
         return program_for_node(prog, sdfg, state, node)
 
+@op_implementation(op="Transpose", name="einsum")
+class EinsumTranspose(ONNXForward):
+    @staticmethod
+    def forward(node: onnx_op.ONNXOp, state: SDFGState,
+                sdfg: SDFG) -> typing.Union[Node, SDFG]:
+        perm = node.perm
+        input_desc = in_desc_with_name(node, state, sdfg, "data")
+        output_desc = out_desc_with_name(node, state, sdfg, "transposed")
+
+        letters = [chr(ord('z') - i) for i in range(26)]
+        input_letters = "".join(letters[i] for i, _ in enumerate(input_desc.shape))
+        output_letters = "".join(letters[i] for i in perm)
+        equation_str = f"{input_letters}->{output_letters}"
+
+        nsdfg = dace.SDFG(node.label + "_expansion")
+        nstate = nsdfg.add_state()
+        einsum_node: nodes.LibraryNode = onnx_op.ONNXEinsum(
+            node.label + "_einsum_expansion", equation=equation_str)
+
+        nstate.add_node(einsum_node)
+        einsum_node.add_in_connector("Inputs__0")
+        nsdfg.add_datadesc("data", copy.deepcopy(input_desc))
+        nsdfg.add_datadesc("transposed", copy.deepcopy(output_desc))
+        nsdfg.arrays["data"].transient = False
+        nsdfg.arrays["transposed"].transient = False
+
+        nstate.add_edge(nstate.add_read("data"), None, einsum_node, "Inputs__0",
+                        nsdfg.make_array_memlet("data"))
+        nstate.add_edge(einsum_node, "Output", nstate.add_write("transposed"), None,
+                        nsdfg.make_array_memlet("transposed"))
+
+        return nsdfg
 
 @op_implementation(op="Transpose", name="pure")
 class PureTranspose(ONNXForward):
@@ -417,6 +450,7 @@ class PureTranspose(ONNXForward):
             transposed[:] = np.transpose(data, axes=perm)
 
         return program_for_node(prog, sdfg, state, node)
+
 
 
 @op_implementation(op="Cast", name="pure")
@@ -631,6 +665,39 @@ class PureSum(ONNXForward):
         return nsdfg
 
 
+@op_implementation(op="Dropout", name="pure")
+class PureDropout(ONNXForward):
+
+    @staticmethod
+    def forward(node: onnx_op.ONNXOp, state: SDFGState,
+                sdfg: SDFG) -> typing.Union[nodes.Node, SDFG]:
+
+        input = in_desc_with_name(node, state, sdfg, "data")
+        nsdfg, nstate, inputs, outputs = empty_sdfg_for_node(sdfg, state, node, add_access_nodes=False)
+        mask_name, mask_desc = sdfg.add_array(node.label + "_mask", input.shape, dace.bool, storage=input.storage, transient=False, find_new_name=True)
+        node.add_in_connector("input_mask")
+        state.add_edge(state.add_read(mask_name), None, node, "input_mask", sdfg.make_array_memlet(mask_name))
+
+
+        nsdfg.add_datadesc("input_mask", copy.deepcopy(mask_desc))
+
+        if "mask" in node.out_connectors:
+            pass
+            # copy_state = nsdfg.add_state_after(nstate)
+            # copy_state.add_edge(copy_state.add_read("input_mask"), None, copy_state.add_write("mask"), None, nsdfg.make_array_memlet("input_mask"))
+
+        map_ranges = {f"i{i}": f"0:{s}" for i, s in enumerate(input.shape)}
+        index_str = f"{', '.join(map_ranges.keys())}"
+        nstate.add_mapped_tasklet("_compute_dropout_",
+                                  map_ranges, dict(mask_value=dace.Memlet(f"input_mask[{index_str}]"),
+                                                   input_value=dace.Memlet(f"data[{index_str}]")),
+                                  "output_value = input_value * mask_value",
+                                  dict(output_value=dace.Memlet(f"output[{index_str}]")),
+                                  external_edges=True)
+
+
+        return nsdfg
+
 @op_implementation(op="LogSoftmax", name="pure")
 class PureLogSoftmax(ONNXForward):
     @staticmethod
@@ -654,3 +721,7 @@ class PureLogSoftmax(ONNXForward):
             output[:] = max_sub - log_sum
 
         return program_for_node(prog, sdfg, state, node)
+
+@python_pure_op_implementation
+def Softplus(X, Y):
+    Y[:] = np.log(1 + np.exp(X))

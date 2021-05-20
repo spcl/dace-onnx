@@ -1,3 +1,4 @@
+import itertools
 import os
 
 import pytest
@@ -8,6 +9,11 @@ from torchvision import datasets, transforms
 from torch import nn, optim
 from transformers import BertLayer, BertConfig
 
+from dace.transformation import dataflow
+
+from daceml import transformation
+
+import daceml.onnx as donnx
 from daceml.pytorch import DaceModule
 from daceml.testing.utils import torch_tensors_close, copy_to_gpu
 
