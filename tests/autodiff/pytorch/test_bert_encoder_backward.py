@@ -19,6 +19,7 @@ def test_bert_encoder_backward(gpu, sdfg_name):
     dace_model = DaceModule(ptmodel,
                             training=False,
                             backward=True,
+                            dist=False,
                             sdfg_name=sdfg_name,
                             apply_strict=True)
 
