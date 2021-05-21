@@ -58,12 +58,14 @@ class DaceModule(nn.Module):
                  cuda: Optional[bool] = None,
                  training: bool = False,
                  backward=False,
+                 dist=False,
                  apply_strict: bool = True,
                  auto_optimize: bool = True,
                  sdfg_name: Optional[str] = None):
         super(DaceModule, self).__init__()
 
         self.backward = backward
+        self.dist = dist
         self.model = module
         self.dace_model: Optional[ONNXModel] = None
         self.training = training
@@ -245,7 +247,7 @@ class DaceModule(nn.Module):
                 hook(self)
 
             if self.backward:
-                function = make_backward_function(dace_model)
+                function = make_backward_function(dace_model, dist=self.dist)
 
                 for _, hook in self.post_autodiff_hooks.items():
                     hook(function._forward_model.sdfg, function._backward_sdfg)

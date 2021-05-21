@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 
 
 def make_backward_function(model: ONNXModel,
+                           dist=False,
                            apply_strict=False
                            ) -> Type[torch.autograd.Function]:
     """ Convert an ONNXModel to a PyTorch differentiable function. This method should not be used on it's own.
@@ -103,6 +104,7 @@ def make_backward_function(model: ONNXModel,
         _backward_sdfg = backward_sdfg
         _forward_model = model
         _backward_result = backward_result
+        _dist = dist
 
         @staticmethod
         def forward(ctx, *inputs):
@@ -202,6 +204,9 @@ def make_backward_function(model: ONNXModel,
                     backward_grad_arrays[name],
                     use_torch=True,
                     zeros=True)
+
+            if DaceFunction._dist:
+                DaceFunction._backward_sdfg.apply_transformations_repeated([transformation.AllreduceGradients], validate_all=True)
 
             DaceFunction._backward_sdfg(**grad_values, **backward_inputs,
                                         **given_grads)
