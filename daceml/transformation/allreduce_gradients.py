@@ -105,7 +105,8 @@ class AllreduceGradients(transformation.Transformation):
 
         sdfg.add_array(gradient_node.data+"_allreduce_sbuffer", 
                        sdfg.arrays[gradient_node.data].shape, 
-                       sdfg.arrays[gradient_node.data].dtype, 
+                       sdfg.arrays[gradient_node.data].dtype,
+                       storage=sdfg.arrays[gradient_node.data].storage, 
                        transient=True)
         allreduce_input = state.add_access(gradient_node.data+"_allreduce_sbuffer")
         
