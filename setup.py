@@ -21,7 +21,7 @@ PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 setup(
     name='daceml',
     version='0.1.0a',
-    url='https://github.com/spcl/dace-onnx',
+    url='https://github.com/spcl/daceml',
     author='SPCL @ ETH Zurich',
     author_email='rauscho@ethz.ch',
     description='DaCe frontend for machine learning',
@@ -37,8 +37,8 @@ setup(
         exclude=["*.tests", "*.tests.*", "tests.*", "tests"]),
     package_data={'': (['*.cpp'] + runtime_files)},
     install_requires=[
-        'dace@git+https://github.com/spcl/dace.git@4c6a674', 'onnx == 1.7.0',
-        'torch', 'dataclasses; python_version < "3.7"'
+        'dace@git+https://github.com/spcl/dace.git@dml-misc-fixes3',
+        'onnx == 1.7.0', 'torch', 'dataclasses; python_version < "3.7"'
     ],
     # install with pip and --find-links (see Makefile)
     # See https://github.com/pypa/pip/issues/5898

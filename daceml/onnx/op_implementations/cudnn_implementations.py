@@ -1,8 +1,9 @@
 import functools
-from typing import Union, Optional, Tuple
+from typing import Union, Optional, Tuple, List
 
 import dace
 from dace import SDFGState, nodes as nd, SDFG, dtypes, data as dt
+from dace.codegen.targets.common import sym2cpp
 
 from daceml.onnx import environments
 from daceml.onnx.converters import clean_onnx_name
@@ -58,24 +59,29 @@ def _get_tensor_layout(desc: dt.Array) -> Optional[str]:
         return None
 
 
-def _cudnn_tensor_descriptor_code(desc: dt.Array, state_field_name: str,
-                                  filter: bool) -> Tuple[str, str]:
+def _cudnn_tensor_descriptor_code(
+        desc: dt.Array,
+        state_field_name: str,
+        filter: bool,
+        shape: Optional[List[int]] = None) -> Tuple[str, str]:
     """ Emit the cudnn code for the tensor descriptor for a given dace descriptor.
 
         :param desc: the descriptor of the dace tensor.
         :param state_field_name: the name of the pointer variable where the descriptor should be stored.
         :param filter: True if the tensor is a filter.
+        :param shape: (optional) the shape to override the shape of the tensor
         :return: the init and exit code
     """
 
     # detect layout
     layout = _get_tensor_layout(desc)
-    if len(desc.shape) == 4:
-        shape = desc.shape
-    elif len(desc.shape) < 4:
-        shape = list(desc.shape) + [1] * (4 - len(desc.shape))
-    else:
-        raise ValueError("Tensor with dimension > 4 is not supported")
+    if shape is None:
+        if len(desc.shape) == 4:
+            shape = desc.shape
+        elif len(desc.shape) < 4:
+            shape = list(desc.shape) + [1] * (4 - len(desc.shape))
+        else:
+            raise ValueError("Tensor with dimension > 4 is not supported")
 
     assert layout is not None, "layout changed after can_be_applied"
     f_or_t_str = 'Filter' if filter else 'Tensor'
@@ -116,10 +122,12 @@ class CudnnConvolution(ONNXForward):
         If this attribute does not exist, it will use `CudnnConvolution.default_algorithm`.
 
     """
-    default_algorithm = "gemm"
+    environments = [environments.cuDNN]
+    default_algorithm = "auto"
 
     # choices for algorithms
     algorithms = [
+        "auto"
         "implicit_gemm",
         "implicit_precomp_gemm",
         "gemm",
@@ -129,8 +137,7 @@ class CudnnConvolution(ONNXForward):
         "winograd",
         "winograd_nonfused",
     ]
-
-    environments = []
+    search_ws_size = 32 * 1024 * 1024
 
     @staticmethod
     def forward_can_be_applied(node: onnx_op.ONNXOp, state: SDFGState,
@@ -206,31 +213,8 @@ class CudnnConvolution(ONNXForward):
                                          sdfg.sdfg_id, sdfg.node_id(state),
                                          state.node_id(node))
 
-        class Environment:
-            cmake_minimum_version = None
-            cmake_packages = []
-            cmake_variables = {}
-            cmake_includes = []
-            cmake_libraries = []
-            cmake_compile_flags = []
-            cmake_link_flags = []
-            cmake_files = []
-            state_fields = [
-                f"cudnnConvolutionDescriptor_t *{unique_id}_conv_desc;",
-                f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
-                f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
-                f"cudnnFilterDescriptor_t *{unique_id}_W_desc;",
-                f"float *{unique_id}_workspace;",
-                f"size_t *{unique_id}_workspace_size;"
-            ]
-            dependencies = [environments.cuDNN]
-            headers = []
-            init_code = ""
-            finalize_code = ""
-
-        Environment.__name__ = unique_id + "_environment"
-        dace.library.environment(Environment)
-        CudnnConvolution.environments = [Environment]
+        init_code = ""
+        finalize_code = ""
 
         # setup tensor descriptors
         for edge, is_input in node.iter_edges(state):
@@ -245,20 +229,15 @@ class CudnnConvolution(ONNXForward):
             is_filter = conn == "W"
             init, exit = _cudnn_tensor_descriptor_code(
                 desc, f"{unique_id}_{conn}_desc", is_filter)
-            Environment.init_code += init
-            Environment.finalize_code += exit
-
-        if hasattr(node, "_algorithm"):
-            algo = node._algorithm
-        else:
-            algo = CudnnConvolution.default_algorithm
+            init_code += init
+            finalize_code += exit
 
         # setup conv descriptor
         # we know padding is symmetric
         pad_h, pad_w = node.pads[0], node.pads[1]
         stride_h, stride_w = node.strides
         dilation_h, dilation_w = node.dilations
-        Environment.init_code += f"""
+        init_code += f"""
         __state->{unique_id}_conv_desc = new cudnnConvolutionDescriptor_t; 
         daceml::cudnn::CheckCudnnError(cudnnCreateConvolutionDescriptor(__state->{unique_id}_conv_desc));
         daceml::cudnn::CheckCudnnError(cudnnSetConvolution2dDescriptor(
@@ -271,16 +250,84 @@ class CudnnConvolution(ONNXForward):
             {dilation_w},
             CUDNN_CROSS_CORRELATION,
             {_DACE_DTYPE_TO_CUDNN_DTYPE[T]}));
+        daceml::cudnn::CheckCudnnError(cudnnSetConvolutionMathType(
+            *__state->{unique_id}_conv_desc,
+            CUDNN_DEFAULT_MATH));
         """
-        Environment.finalize_code += f"""
+
+        if node.group != 1:
+            init_code += f"""
+            daceml::cudnn::CheckCudnnError(cudnnSetConvolutionGroupCount(
+                *__state->{unique_id}_conv_desc,
+                {node.group}
+                ));
+            """
+
+        finalize_code += f"""
         daceml::cudnn::CheckCudnnError(cudnnDestroyConvolutionDescriptor(*__state->{unique_id}_conv_desc));
         delete __state->{unique_id}_conv_desc;
         """
+        # setup algo
+        init_code += f"""
+        {environments.cuDNN.handle_setup_code(node, init_stream=False)}
+        """
+
+        if hasattr(node, "_algorithm"):
+            algo = node._algorithm
+        else:
+            algo = CudnnConvolution.default_algorithm
+        if algo == "auto":
+
+            # setup fake data
+            free_fake_data_code, fake_data_init_code = setup_fake_data(
+                node, sdfg, state, False)
+
+
+            init_code += f"""
+            // setup fake data
+            {fake_data_init_code}
+
+            // setup workspace
+            void *search_ws; 
+            cudaMalloc(&search_ws, {CudnnConvolution.search_ws_size});
+            // run search
+            cudnnConvolutionFwdAlgoPerf_t results;
+            int algo_count = 1;
+            daceml::cudnn::CheckCudnnError(cudnnFindConvolutionForwardAlgorithmEx(
+                __dace_cudnn_handle,
+                *__state->{unique_id}_X_desc,
+                fake_X,
+                *__state->{unique_id}_W_desc,
+                fake_W,
+                *__state->{unique_id}_conv_desc,
+                *__state->{unique_id}_Y_desc,
+                fake_Y,
+                1,
+                &algo_count,
+                &results,
+                search_ws,
+                {CudnnConvolution.search_ws_size}
+            ));
+            cudaFree(search_ws);
+            __state->{unique_id}_algo = new cudnnConvolutionFwdAlgo_t;
+            *__state->{unique_id}_algo = results.algo;
+            printf("{unique_id} using algo %d\\n", *__state->{unique_id}_algo);
+            
+            {free_fake_data_code}
+            """
+        else:
+            init_code += f"""
+            __state->{unique_id}_algo = new cudnnConvolutionFwdAlgo_t;
+            *__state->{unique_id}_algo = CUDNN_CONVOLUTION_FWD_ALGO_{algo.upper()};
+            """
+
+        finalize_code += f"""
+             delete __state->{unique_id}_algo;
+        """
 
         # setup workspace
-        Environment.init_code += \
+        init_code += \
             f"""
-        {environments.cuDNN.handle_setup_code(node, init_stream=False)}
         // Setup workspace for {unique_id}
         size_t ws_size;
         daceml::cudnn::CheckCudnnError(cudnnGetConvolutionForwardWorkspaceSize(
@@ -289,13 +336,13 @@ class CudnnConvolution(ONNXForward):
             *__state->{unique_id}_W_desc,
             *__state->{unique_id}_conv_desc,
             *__state->{unique_id}_Y_desc,
-            CUDNN_CONVOLUTION_FWD_ALGO_{algo.upper()},
+            *__state->{unique_id}_algo,
             &ws_size));
         __state->{unique_id}_workspace_size = new size_t;
         *__state->{unique_id}_workspace_size = ws_size;
         cudaMalloc(&__state->{unique_id}_workspace, ws_size);
         """
-        Environment.finalize_code += f"""
+        finalize_code += f"""
         cudaFree(__state->{unique_id}_workspace);
         delete __state->{unique_id}_workspace_size;
         """
@@ -312,7 +359,7 @@ class CudnnConvolution(ONNXForward):
             *__state->{unique_id}_W_desc,
             _W,
             *__state->{unique_id}_conv_desc,
-            CUDNN_CONVOLUTION_FWD_ALGO_{algo.upper()},
+            *__state->{unique_id}_algo,
             __state->{unique_id}_workspace,
             *__state->{unique_id}_workspace_size,
             &beta,
@@ -321,10 +368,27 @@ class CudnnConvolution(ONNXForward):
         ));
         """
 
-        tasklet = nstate.add_tasklet(unique_id, {
-            "_X": dace.pointer(T),
-            "_W": dace.pointer(T)
-        }, {"_Y": dace.pointer(T)}, tasklet_code, dtypes.Language.CPP)
+        init_code = "{\n" + init_code + "\n}"
+        finalize_code = "{\n" + finalize_code + "\n}"
+
+        tasklet = nstate.add_tasklet(
+            unique_id, {
+                "_X": dace.pointer(T),
+                "_W": dace.pointer(T)
+            }, {"_Y": dace.pointer(T)},
+            tasklet_code,
+            dtypes.Language.CPP,
+            code_init=init_code,
+            code_exit=finalize_code,
+            state_fields=[
+                f"cudnnConvolutionDescriptor_t *{unique_id}_conv_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
+                f"cudnnConvolutionFwdAlgo_t *{unique_id}_algo;",
+                f"cudnnFilterDescriptor_t *{unique_id}_W_desc;",
+                f"float *{unique_id}_workspace;",
+                f"size_t *{unique_id}_workspace_size;"
+            ])
         nstate.add_edge(inputs["X"], None, tasklet, "_X",
                         nsdfg.make_array_memlet("X"))
         nstate.add_edge(inputs["W"], None, tasklet, "_W",
@@ -336,9 +400,40 @@ class CudnnConvolution(ONNXForward):
         return nsdfg
 
 
+def setup_fake_data(node, sdfg, state, bwd) -> Tuple[str, str]:
+    free_fake_data_code = ""
+    init_code = ""
+
+    for edge, is_input in node.iter_edges(state):
+        conn = edge.dst_conn if is_input else edge.src_conn
+        desc = in_desc_with_name(node, state, sdfg,
+                                 conn) if is_input else out_desc_with_name(
+                                     node, state, sdfg, conn)
+        assert isinstance(desc, dt.Array)
+        init_code += f"""
+            void *fake_{conn};
+            cudaMalloc(&fake_{conn}, {sym2cpp(desc.total_size * desc.dtype.bytes)});
+            cudaMemset(fake_{conn}, 0, {sym2cpp(desc.total_size * desc.dtype.bytes)});
+            """
+        free_fake_data_code += f"""
+            cudaFree(fake_{conn});
+            """
+        if bwd:
+            init_code += f"""
+                void *fake_d{conn};
+                cudaMalloc(&fake_d{conn}, {sym2cpp(desc.total_size * desc.dtype.bytes)});
+                cudaMemset(fake_d{conn}, 0, {sym2cpp(desc.total_size * desc.dtype.bytes)});
+                """
+            free_fake_data_code += f"""
+                cudaFree(fake_d{conn});
+                """
+
+    return free_fake_data_code, init_code
+
+
 @op_implementation(op="BatchNormalization", name="cuDNN")
 class CudnnBatchNormalizationTraining(ONNXForward):
-    environments = []
+    environments = [environments.cuDNN]
 
     @staticmethod
     def forward_can_be_applied(node: onnx_op.ONNXOp, state: SDFGState,
@@ -357,8 +452,10 @@ class CudnnBatchNormalizationTraining(ONNXForward):
         return True
 
     @staticmethod
-    def forward(node: onnx_op.ONNXOp, state: SDFGState,
-                sdfg: SDFG) -> Union[nd.Node, SDFG]:
+    def forward(node: onnx_op.ONNXOp,
+                state: SDFGState,
+                sdfg: SDFG,
+                reserved_ptr=False) -> Union[nd.Node, SDFG]:
 
         nsdfg, nstate, inputs, outputs = empty_sdfg_for_node(sdfg, state, node)
 
@@ -369,47 +466,23 @@ class CudnnBatchNormalizationTraining(ONNXForward):
                                          sdfg.sdfg_id, sdfg.node_id(state),
                                          state.node_id(node))
 
-        class Environment:
-            cmake_minimum_version = None
-            cmake_packages = []
-            cmake_variables = {}
-            cmake_includes = []
-            cmake_libraries = []
-            cmake_compile_flags = []
-            cmake_link_flags = []
-            cmake_files = []
-            state_fields = [
-                f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
-                f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
-                f"cudnnTensorDescriptor_t *{unique_id}_scale_desc;",
-                f"float *{unique_id}_workspace;",
-                f"size_t *{unique_id}_workspace_size;"
-                f"float *{unique_id}_reserved;",
-                f"size_t *{unique_id}_reserved_size;"
-            ]
-            dependencies = [environments.cuDNN]
-            headers = []
-            init_code = ""
-            finalize_code = ""
-
-        Environment.__name__ = unique_id + "_environment"
-        dace.library.environment(Environment)
-        CudnnBatchNormalizationTraining.environments = [Environment]
+        init_code = ""
+        finalize_code = ""
 
         init, exit = _cudnn_tensor_descriptor_code(inputs["X"].desc(nsdfg),
                                                    f"{unique_id}_X_desc",
                                                    False)
-        Environment.init_code += init
-        Environment.finalize_code += exit
+        init_code += init
+        finalize_code += exit
 
         init, exit = _cudnn_tensor_descriptor_code(outputs["Y"].desc(nsdfg),
                                                    f"{unique_id}_Y_desc",
                                                    False)
-        Environment.init_code += init
-        Environment.finalize_code += exit
+        init_code += init
+        finalize_code += exit
 
         # setup scale descriptor
-        Environment.init_code += f"""
+        init_code += f"""
         __state->{unique_id}_scale_desc = new cudnnTensorDescriptor_t; 
         daceml::cudnn::CheckCudnnError(cudnnCreateTensorDescriptor(__state->{unique_id}_scale_desc));
         daceml::cudnn::CheckCudnnError(cudnnDeriveBNTensorDescriptor(
@@ -417,13 +490,13 @@ class CudnnBatchNormalizationTraining(ONNXForward):
             *__state->{unique_id}_X_desc,
             CUDNN_BATCHNORM_SPATIAL));
         """
-        Environment.finalize_code += f"""
+        finalize_code += f"""
         daceml::cudnn::CheckCudnnError(cudnnDestroyTensorDescriptor(*__state->{unique_id}_scale_desc));
         delete __state->{unique_id}_scale_desc;
         """
 
         # setup workspace and reserve space
-        Environment.init_code += \
+        init_code += \
             f"""
         {environments.cuDNN.handle_setup_code(node, init_stream=False)}
         // Setup workspace and reserved space for {unique_id}
@@ -454,7 +527,7 @@ class CudnnBatchNormalizationTraining(ONNXForward):
         *__state->{unique_id}_reserved_size = rs_size;
         cudaMalloc(&__state->{unique_id}_reserved, rs_size);
         """
-        Environment.finalize_code += f"""
+        finalize_code += f"""
         cudaFree(__state->{unique_id}_workspace);
         cudaFree(__state->{unique_id}_reserved);
         delete __state->{unique_id}_reserved_size;
@@ -491,15 +564,51 @@ class CudnnBatchNormalizationTraining(ONNXForward):
             *__state->{unique_id}_workspace_size,
             __state->{unique_id}_reserved,
             *__state->{unique_id}_reserved_size));
+
+            // save the reserved ptr as an output if required
+            {f"_reserved_ptr = __state->{unique_id}_reserved;" if reserved_ptr else ""}
+            {f"_reserved_size = *__state->{unique_id}_reserved_size;" if reserved_ptr else ""}
         """
 
         in_connectors = ["X", "B", "scale", "in_mean", "in_var"]
-        out_connectors = ["Y", "saved_mean", "saved_var"]
+        out_connectors = {
+            "Y": dace.pointer(T),
+            "saved_mean": dace.pointer(T),
+            "saved_var": dace.pointer(T)
+        }
+        if reserved_ptr:
+            out_connectors["reserved_size"] = dace.int64
+            out_connectors["reserved_ptr"] = dace.pointer(dace.typeclass(None))
+            nsdfg.add_scalar(f"reserved_ptr",
+                             dace.pointer(dace.typeclass(None)),
+                             storage=dtypes.StorageType.CPU_Heap)
+            nsdfg.add_scalar(f"reserved_size",
+                             dace.int64,
+                             storage=dtypes.StorageType.CPU_Heap)
+            outputs["reserved_ptr"] = nstate.add_write("reserved_ptr")
+            outputs["reserved_size"] = nstate.add_write("reserved_size")
+
+        init_code = "{\n" + init_code + "\n}"
+        finalize_code = "{\n" + finalize_code + "\n}"
+
         tasklet = nstate.add_tasklet(
             unique_id, {f"_{i}": dace.pointer(T)
                         for i in in_connectors},
-            {f"_{i}": dace.pointer(T)
-             for i in out_connectors}, tasklet_code, dtypes.Language.CPP)
+            {f"_{i}": t
+             for i, t in out_connectors.items()},
+            tasklet_code,
+            dtypes.Language.CPP,
+            code_init=init_code,
+            code_exit=finalize_code,
+            state_fields=[
+                f"cudnnTensorDescriptor_t *{unique_id}_Y_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_X_desc;",
+                f"cudnnTensorDescriptor_t *{unique_id}_scale_desc;",
+                f"float *{unique_id}_workspace;",
+                f"size_t *{unique_id}_workspace_size;"
+                f"float *{unique_id}_reserved;",
+                f"size_t *{unique_id}_reserved_size;"
+            ])
 
         for inp in in_connectors:
             nstate.add_edge(inputs[inp], None, tasklet, f"_{inp}",

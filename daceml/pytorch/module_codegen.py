@@ -40,7 +40,10 @@ _REPLACED_CTYPES = {dace.int64: "int64_t", dace.uint64: "uint64_t"}
 
 
 def torch_ctype(dtype: dace.typeclass) -> str:
-    if dtype in _REPLACED_CTYPES:
+    if isinstance(dtype, dace.pointer):
+        # assuming pointers are 64 bit
+        ctype = "int64_t"
+    elif dtype in _REPLACED_CTYPES:
         ctype = _REPLACED_CTYPES[dtype]
     else:
         ctype = dtype.ctype
@@ -71,6 +74,14 @@ _TYPECLASS_TO_TORCH_DTYPE_STR = {
 }
 
 
+def typeclass_to_torch_cpp_type(type: dace.typeclass) -> str:
+    if isinstance(type, dace.pointer):
+        # assuming pointers are 64 bit
+        return "kInt64"
+    else:
+        return _TYPECLASS_TO_TORCH_DTYPE_STR[type]
+
+
 def tensor_init_for_desc(name: str, desc: data.Data, zeros=False) -> str:
     """ Emit the initialization code for a descriptor.
     """
@@ -78,7 +89,7 @@ def tensor_init_for_desc(name: str, desc: data.Data, zeros=False) -> str:
 Tensor {name} = torch::{'zeros' if zeros else 'empty'}(
     {{{', '.join(str(s) for s in desc.shape)}}},
     torch::TensorOptions()
-        .dtype(torch::{_TYPECLASS_TO_TORCH_DTYPE_STR[desc.dtype]})
+        .dtype(torch::{typeclass_to_torch_cpp_type(desc.dtype)})
         .device(torch::{'kCUDA' if is_cuda(desc.storage) else 'kCPU'})
         .layout(torch::kStrided));
     """
@@ -131,6 +142,7 @@ def argument_codegen(
     for name in input_names:
         tctype = torch_ctype(arglist[name].dtype)
         dctype = arglist[name].dtype
+
         if isinstance(arglist[name], data.Array) or dt.can_access(
                 dt.ScheduleType.GPU_Device, arglist[name].storage):
             if name in guard_contiguous:
@@ -206,7 +218,7 @@ def constant_initializer_code(name: str, desc: data.Data, value) -> str:
         iterator = np.nditer(value.cpu().numpy(), order="C")
         gpu_copy_code = f"""
         Tensor {name} = torch::from_blob({name}_ptr_cpu, {{{', '.join(sym2cpp(s) for s in desc.shape)}}},
-            {{{', '.join(sym2cpp(s) for s in desc.strides)}}}, torch::{_TYPECLASS_TO_TORCH_DTYPE_STR[desc.dtype]})
+            {{{', '.join(sym2cpp(s) for s in desc.strides)}}}, torch::{typeclass_to_torch_cpp_type(desc.dtype)})
             .to(torch::kCUDA);
         {desc.dtype.ctype} *{name}_ptr = reinterpret_cast<{desc.dtype.ctype}*>({name}.data_ptr<{torch_ctype(desc.dtype)}>());
         """
@@ -246,9 +258,10 @@ def recover_saved_inputs_outputs(saved_inputs_outputs: List[str],
 def setup_grad_values(backward_result: BackwardResult, sdfg: dace.SDFG,
                       outputs: List[str]) -> str:
     code = "// input grads"
-    for _, grad_name in backward_result.required_grad_names.items():
+    for param_name, grad_name in backward_result.required_grad_names.items():
+        zero_init = backward_result.zero_init.get(param_name, True)
         code += "\n" + tensor_init_for_desc(
-            grad_name, sdfg.arrays[grad_name], zeros=True)
+            grad_name, sdfg.arrays[grad_name], zeros=zero_init)
 
     code += "// output grads"
     for i, o in enumerate(outputs):
@@ -361,22 +374,22 @@ class {sdfg_name}Function : public torch::autograd::Function<{sdfg_name}Function
             // return calculated grads in correct order
             // first two grads are None (these are the grads for the handle ptrs)
             return {{
-                Tensor(), Tensor(), {', '.join(backward_result.required_grad_names[i] for i in inputs)}
-            }};
-        }}
+                Tensor(), Tensor(), {', '.join(backward_result.required_grad_names[i] if i in backward_result.required_grad_names else 'Tensor()' for i in inputs )}
+    }};
+}}
 }};
 
 {ret_str}
 {sdfg_name}_autograd(int64_t handle_ptr, int64_t bwd_handle_ptr, {",".join(f"const Tensor& {name}_" for name in inputs)}) {{
-    return {sdfg_name}Function::apply(
-        handle_ptr, bwd_handle_ptr, {", ".join(f"{name}_" for name in inputs)}
-    );
+return {sdfg_name}Function::apply(
+handle_ptr, bwd_handle_ptr, {", ".join(f"{name}_" for name in inputs)}
+);
 }}
 
 TORCH_LIBRARY_IMPL(daceml_{sdfg_name}, Autograd{'CUDA' if module.use_cuda else 'CPU'}, m) {{
-    m.impl("{sdfg_name}", {sdfg_name}_autograd);
+m.impl("{sdfg_name}", {sdfg_name}_autograd);
 }}
-        """
+"""
 
 
 def code_for_module(module: 'daceml.pytorch.DaceModule',
