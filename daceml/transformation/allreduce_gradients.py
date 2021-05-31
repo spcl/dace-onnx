@@ -15,7 +15,6 @@ from dace.sdfg import nodes as nd
 from dace.sdfg import utils as sdutil
 from dace.memlet import Memlet
 import dace.libraries.mpi as mpi
-from mpi4py import MPI as MPI4PY
 
 import daceml.onnx as donnx
 from daceml.onnx.converters import clean_onnx_name
