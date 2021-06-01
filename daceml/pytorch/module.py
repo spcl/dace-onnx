@@ -115,7 +115,7 @@ class DaceModule(nn.Module):
                                         transients_outputs)
         if dist:
             from daceml import transformation
-            self.append_post_autodiff_hook("distributed", lambda f, b: b.apply_transformation(transformation.AllreduceGradients))
+            self.append_post_autodiff_hook("distributed", lambda f, b: b.apply_transformations(transformation.AllreduceGradients))
            
 
         # setup optimization hooks
