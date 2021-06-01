@@ -591,7 +591,7 @@ class BackwardPassGenerator:
         else:
             raise ValueError(f"Unsupported storage {arr.storage}")
 
-        if type(arr) is dt.Array:
+        if type(arr) is dt.Array or type(arr) is dt.Scalar:
             state.add_mapped_tasklet(
                 "_init_" + data + "_", {
                     "i{}".format(i): "0:{}".format(shape)
@@ -606,12 +606,6 @@ class BackwardPassGenerator:
                 schedule=dtypes.ScheduleType.GPU_Device
                 if cuda else dtypes.ScheduleType.Default,
                 external_edges=True)
-        elif type(arr) is dt.Scalar:
-            tasklet = state.add_tasklet("_init_" + data + "_", {}, {"__out"},
-                                        "__out = {}".format(scalar))
-            write = state.add_write(data)
-            state.add_edge(tasklet, "__out", write, None,
-                           Memlet.simple(data, "0"))
         elif type(arr) is dt.View:
             # not need to initialize: the viewed array will always be visited
             # (since a view can never be a required grad), and thus the viewed array will be initialized.
@@ -685,7 +679,8 @@ class BackwardPassGenerator:
                             access_intermediate = self.backward_state.add_access(
                                 intermediate_name)
 
-                            edge.data.data = intermediate_name
+                            for mte in self.backward_state.memlet_tree(edge):
+                                mte.data.data = intermediate_name
                             new_edge = self.backward_state.add_edge(
                                 edge.src, edge.src_conn, access_intermediate,
                                 None, edge.data)
@@ -717,8 +712,8 @@ class BackwardPassGenerator:
                             self.backward_state.in_edges(reversed_node)[0])
 
             except AutoDiffException as e:
-                raise AutoDiffException(
-                    "Failed at node {}".format(node)) from e
+                raise AutoDiffException("Failed at node {}: {}".format(
+                    node, str(e))) from e
 
     def _set_wcr_sum_if_needed(self, edge: dgraph.MultiConnectorEdge):
         """ Set the WCR to sum for all edges along the path of edge, if needed.

@@ -14,7 +14,9 @@ def run_pytorch_module(module,
                        gpu,
                        shape=None,
                        use_max=False,
-                       auto_optimize=True):
+                       auto_optimize=True,
+                       rtol=1e-4,
+                       atol=1e-3):
     shape = shape or (3, 5)
 
     module = copy_to_gpu(gpu, module)
@@ -53,7 +55,11 @@ def run_pytorch_module(module,
     else:
         dace_s = dace_module(dace_input).sum()
     dace_s.backward()
-    torch_tensors_close("output", pytorch_input.grad, dace_input.grad)
+    torch_tensors_close("output",
+                        pytorch_input.grad,
+                        dace_input.grad,
+                        rtol=rtol,
+                        atol=atol)
 
 
 def test_simple(sdfg_name, gpu):
@@ -125,7 +131,12 @@ def test_layernorm(sdfg_name, gpu):
         def forward(self, x):
             return self.ln(x)
 
-    run_pytorch_module(Module(), sdfg_name, gpu, shape=(1, 3), use_max=True)
+    run_pytorch_module(Module(),
+                       sdfg_name,
+                       gpu,
+                       shape=(1, 3),
+                       use_max=True,
+                       atol=1e-2)
 
 
 def test_weights(sdfg_name, gpu):
@@ -185,5 +196,17 @@ def test_batched_matmul(sdfg_name, gpu):
 
         def forward(self, x):
             return self.fc1 @ x
+
+    run_pytorch_module(Module(), sdfg_name, gpu, use_max=False)
+
+
+def test_scalar_forwarding(sdfg_name, gpu):
+    class Module(torch.nn.Module):
+        def __init__(self):
+            super(Module, self).__init__()
+            self.factor = nn.Parameter(torch.ones(()))
+
+        def forward(self, x):
+            return self.factor * x
 
     run_pytorch_module(Module(), sdfg_name, gpu, use_max=False)

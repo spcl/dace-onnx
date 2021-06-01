@@ -1,6 +1,8 @@
+import collections
 import functools
 import logging
-import typing
+from typing import Optional, Set, Callable
+
 from functools import wraps
 
 import dace
@@ -85,8 +87,7 @@ def out_edge_with_name(node: nd.Node, state: SDFGState,
     return cands[0]
 
 
-def find_str_not_in_set(existing: typing.Set[str],
-                        target_str: typing.Optional[str]) -> str:
+def find_str_not_in_set(existing: Set[str], target_str: Optional[str]) -> str:
     """ Try to find a new str that is not in the set.
 
         :param existing: the existing strs.
@@ -104,11 +105,13 @@ def find_str_not_in_set(existing: typing.Set[str],
     return base_name + "_" + str(i)
 
 
-def expand_onnx_nodes(sdfg: dace.SDFG):
+def expand_onnx_nodes(sdfg: dace.SDFG,
+                      predicate: Optional[Callable[[nd.Node], bool]] = None):
     """ Recursively expand all onnx library nodes in the SDFG, resulting in an SDFG that can be optimized by
         dace transformations. Will also specialize dace matmuls.
 
         :param sdfg: the sdfg to expand nodes on.
+        :param predicate: a predicate that will be called to check if a node should be expanded.
     """
     # avoid import loop
     from daceml.onnx.nodes.onnx_op import ONNXOp
@@ -121,13 +124,15 @@ def expand_onnx_nodes(sdfg: dace.SDFG):
             if isinstance(node, nd.NestedSDFG):
                 expand_onnx_nodes(node.sdfg)
             elif isinstance(node, ONNXOp) or isinstance(node, blas.MatMul):
-                impl_name = node.expand(sdfg, state)
-                print(
-                    "Automatically expanded library node \"{}\" with implementation \"{}\"."
-                    .format(str(node), impl_name))
-                # We made a copy of the original list of nodes, so we keep
-                # iterating even though this list has now changed
-                expanded_something = True
+                if predicate is None or predicate(node):
+                    impl_name = node.expand(sdfg, state)
+                    if dace.Config.get_bool('debugprint'):
+                        print(
+                            "Automatically expanded library node \"{}\" with implementation \"{}\"."
+                            .format(str(node), impl_name))
+                    # We made a copy of the original list of nodes, so we keep
+                    # iterating even though this list has now changed
+                    expanded_something = True
         if expanded_something:
             states.append(state)  # Nodes have changed. Check state again
 
@@ -199,3 +204,28 @@ def platform_library_name(libname: str) -> str:
     prefix = dace.Config.get('compiler', 'library_prefix')
     suffix = dace.Config.get('compiler', 'library_extension')
     return f"{prefix}{libname}.{suffix}"
+
+
+def remove_output_connector(sdfg: dace.SDFG, state: dace.SDFGState,
+                            node: nd.Node, conn_name: str):
+    """ Remove an output connector (only possible if the connector doesn't write to a non-transient).
+
+        :param sdfg: the sdfg containing the node.
+        :param state: the state containing the node.
+        :param node: the node
+        :param conn_name: the name of the connector to remove
+    """
+    queue = collections.deque(
+        e.dst for e in state.out_edges_by_connector(node, conn_name))
+    while len(queue) > 0:
+        current_node = queue.popleft()
+
+        edges = state.out_edges(current_node)
+        state.remove_node(current_node)
+        for e in edges:
+            if not sdfg.arrays[e.data.data].transient:
+                raise ValueError(
+                    "Tried to remove a connector that wrote to a non-transient"
+                )
+
+            queue.append(e.dst)
